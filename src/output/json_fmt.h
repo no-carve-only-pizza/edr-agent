@@ -23,3 +23,6 @@ std::string to_json(const file_event    &e, const std::vector<RuleMatch> &hits);
 std::string to_json(const net_event     &e, const std::vector<RuleMatch> &hits);
 std::string to_json(const ptrace_event  &e, const std::vector<RuleMatch> &hits);
 std::string to_json(const memory_event  &e, const std::vector<RuleMatch> &hits);
+std::string to_json(const memfd_event   &e, const std::vector<RuleMatch> &hits);
+std::string to_json(const dns_event     &e, const std::vector<RuleMatch> &hits);
+std::string to_json(const ns_event      &e, const std::vector<RuleMatch> &hits);

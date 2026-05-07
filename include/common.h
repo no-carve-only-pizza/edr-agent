@@ -44,6 +44,15 @@
 #define MAX_ARGV_LEN 256
 #define MAX_ARGC       8
 
+/*
+ * DNS 모니터링 상수 (dns_monitor.bpf.c / rule_engine):
+ *
+ *   DNS_NAME_MAX: 파싱된 도메인명 저장 길이.
+ *                 RFC 1035 최대치는 253자지만 128로 충분히 커버된다.
+ *                 BPF 검증기 AND 마스크 패턴을 위해 2의 거듭제곱으로 유지.
+ */
+#define DNS_NAME_MAX 128
+
 /* ── 이벤트 타입 ─────────────────────────────────────────────────────── */
 
 /*
@@ -58,6 +67,8 @@
 #define EVENT_NET_BIND    6u  /* sys_enter_bind: 포트 바인드(서버 오픈)      */
 #define EVENT_PROC_EXIT   7u  /* sched_process_exit: 프로세스 정상 종료      */
 #define EVENT_PROC_PTRACE 8u  /* sys_enter_ptrace: ptrace ATTACH 감지        */
+#define EVENT_PROC_MEMFD  9u  /* sys_enter_memfd_create: 익명 파일 생성      */
+#define EVENT_PROC_NS    10u  /* sys_enter_unshare: 네임스페이스 분리 시도   */
 
 /* ── 구조체 정의 ─────────────────────────────────────────────────────── */
 
@@ -188,6 +199,67 @@ struct memory_event {
     char  comm[TASK_COMM_LEN];
     __u32 prot;         /* 요청된 권한 플래그 */
     __u32 is_mprotect;  /* 0: mmap, 1: mprotect */
+};
+
+/*
+ * dns_event: DNS 쿼리 이벤트 (R-018).
+ *
+ * sys_enter_sendto 훅에서 UDP 포트 53 패킷을 감지하고,
+ * BPF 내에서 DNS 와이어 포맷 QNAME 을 점 구분 문자열로 파싱해 저장한다.
+ *
+ *   server[16]: DNS 서버 IP (IPv4 = 앞 4바이트, 나머지 0)
+ *   name:       "www.google.com" 형식의 파싱된 도메인명
+ */
+struct dns_event {
+    __u32 pid;
+    __u32 uid;
+    __u64 ts_ns;
+    char  comm[TASK_COMM_LEN]; /* 16 bytes */
+    __u8  server[16];          /* DNS 서버 IP */
+    __u16 family;              /* AF_INET(2) / AF_INET6(10) */
+    __u16 _pad;
+    char  name[DNS_NAME_MAX];  /* 파싱된 도메인명 */
+};
+
+/*
+ * memfd_event: memfd_create() 익명 파일 생성 이벤트 (R-017).
+ *
+ * memfd_create()는 파일시스템에 이름이 없는 익명 파일 디스크립터를 생성한다.
+ * 파일리스 공격에서 다음 패턴으로 악용된다:
+ *   memfd_create() → write(셸코드) → fexecve(fd)
+ *
+ * name: 사람이 읽는 레이블 (경로가 아님). 빈 문자열("") 이면 더 의심스럽다.
+ * flags: MFD_CLOEXEC=0x1, MFD_ALLOW_SEALING=0x2 (밀봉된 불변 코드 → critical)
+ */
+struct memfd_event {
+    __u32 pid;
+    __u32 uid;
+    __u32 flags;              /* MFD_* 플래그 조합 */
+    __u64 ts_ns;
+    char  comm[TASK_COMM_LEN];
+    char  name[64];           /* memfd_create() 의 name 인자 (레이블) */
+};
+
+/*
+ * ns_event: 네임스페이스 분리(unshare) 이벤트 (R-024).
+ *
+ * sys_enter_unshare 트레이스포인트에서 CLONE_NEW* 플래그를 포함한 호출만 캡처.
+ * 컨테이너 내부에서의 네임스페이스 분리는 탈출 시도의 핵심 지표다.
+ *
+ * in_container: BPF 에서 현재 PID 네임스페이스 inum 을 init 네임스페이스와
+ *               비교해 결정. 1 이면 컨테이너(또는 다른 네임스페이스) 내부.
+ * ns_inum:      현재 PID 네임스페이스의 inode 번호 (커널 nsproxy 에서 읽음).
+ * flags:        unshare() 에 전달된 CLONE_NEW* 플래그 조합.
+ */
+struct ns_event {
+    __u32 pid;
+    __u32 uid;
+    __u64 ts_ns;
+    char  comm[TASK_COMM_LEN];
+    __u32 flags;         /* CLONE_NEW* 플래그 조합                    */
+    __u8  in_container;  /* 1 = 현재 PID 네임스페이스 ≠ init 네임스페이스 */
+    __u8  _pad[3];
+    __u64 ns_inum;       /* 현재 PID 네임스페이스 inode 번호           */
 };
 
 #endif /* EDR_COMMON_H */

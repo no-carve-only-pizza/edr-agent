@@ -60,6 +60,16 @@ set(MEM_BPF_SRC  ${CMAKE_SOURCE_DIR}/bpf/memory_monitor.bpf.c)
 set(MEM_BPF_OBJ  ${CMAKE_BINARY_DIR}/memory_monitor.bpf.o)
 set(MEM_BPF_SKEL ${CMAKE_BINARY_DIR}/memory_monitor.skel.h)
 
+# dns_monitor
+set(DNS_BPF_SRC  ${CMAKE_SOURCE_DIR}/bpf/dns_monitor.bpf.c)
+set(DNS_BPF_OBJ  ${CMAKE_BINARY_DIR}/dns_monitor.bpf.o)
+set(DNS_BPF_SKEL ${CMAKE_BINARY_DIR}/dns_monitor.skel.h)
+
+# ns_monitor
+set(NS_BPF_SRC  ${CMAKE_SOURCE_DIR}/bpf/ns_monitor.bpf.c)
+set(NS_BPF_OBJ  ${CMAKE_BINARY_DIR}/ns_monitor.bpf.o)
+set(NS_BPF_SKEL ${CMAKE_BINARY_DIR}/ns_monitor.skel.h)
+
 # 공통 clang 플래그 (BPF 크로스 컴파일)
 set(BPF_CFLAGS
     -g -O2 -target bpf -D__TARGET_ARCH_x86
@@ -141,7 +151,42 @@ add_custom_command(
     VERBATIM
 )
 
-add_custom_target(bpf_build DEPENDS ${PROC_BPF_SKEL} ${FILE_BPF_SKEL} ${NET_BPF_SKEL} ${MEM_BPF_SKEL})
+# ── Step B-5: dns_monitor 컴파일 & 스켈레톤 생성 ─────────────────────────
+add_custom_command(
+    OUTPUT  ${DNS_BPF_OBJ}
+    COMMAND ${CLANG} ${BPF_CFLAGS} -c ${DNS_BPF_SRC} -o ${DNS_BPF_OBJ}
+    DEPENDS ${DNS_BPF_SRC} ${VMLINUX_H}
+    COMMENT "BPF 컴파일: dns_monitor.bpf.c"
+    VERBATIM
+)
+add_custom_command(
+    OUTPUT  ${DNS_BPF_SKEL}
+    COMMAND ${BPFTOOL} gen skeleton ${DNS_BPF_OBJ} > ${DNS_BPF_SKEL}
+    DEPENDS ${DNS_BPF_OBJ}
+    COMMENT "스켈레톤 생성: dns_monitor.skel.h"
+    VERBATIM
+)
+
+# ── Step B-6: ns_monitor 컴파일 & 스켈레톤 생성 ──────────────────────────
+add_custom_command(
+    OUTPUT  ${NS_BPF_OBJ}
+    COMMAND ${CLANG} ${BPF_CFLAGS} -c ${NS_BPF_SRC} -o ${NS_BPF_OBJ}
+    DEPENDS ${NS_BPF_SRC} ${VMLINUX_H}
+    COMMENT "BPF 컴파일: ns_monitor.bpf.c"
+    VERBATIM
+)
+add_custom_command(
+    OUTPUT  ${NS_BPF_SKEL}
+    COMMAND ${BPFTOOL} gen skeleton ${NS_BPF_OBJ} > ${NS_BPF_SKEL}
+    DEPENDS ${NS_BPF_OBJ}
+    COMMENT "스켈레톤 생성: ns_monitor.skel.h"
+    VERBATIM
+)
+
+add_custom_target(bpf_build DEPENDS
+    ${PROC_BPF_SKEL} ${FILE_BPF_SKEL} ${NET_BPF_SKEL}
+    ${MEM_BPF_SKEL}  ${DNS_BPF_SKEL}  ${NS_BPF_SKEL}
+)
 
 # ── libcurl (마일스톤 5: HTTP 리포터) ────────────────────────────────────
 find_package(CURL REQUIRED)
@@ -151,8 +196,10 @@ add_executable(edr-agent
     src/main.cpp
     src/proc_tree.cpp
     src/rules/rule_engine.cpp
+    src/rules/rule_config.cpp
     src/output/json_fmt.cpp
     src/output/http_reporter.cpp
+    src/correlation/correlator.cpp
 )
 
 add_dependencies(edr-agent bpf_build)

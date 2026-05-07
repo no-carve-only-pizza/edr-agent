@@ -6,11 +6,12 @@
  *   각 이벤트 구조체(process_event, file_event, net_event)를 받아
  *   매칭된 룰 목록을 반환하는 순수 함수(stateless) 인터페이스.
  *
- *   룰은 rule_engine.cpp 의 정적 테이블에 정의된다.
- *   런타임에 파일에서 로드하는 기능은 마일스톤 4+ 에서 추가.
+ *   룰 데이터베이스는 rule_engine.cpp 의 정적 벡터에 정의된다.
+ *   init_rules(cfg) 를 호출하면 YAML 에서 로드한 RuleConfig 로 덮어쓴다.
  */
 #include <vector>
 #include "common.h"
+#include "rules/rule_config.h"
 
 struct RuleMatch {
     const char *id;        /* "R-001" 형식의 고유 식별자     */
@@ -24,6 +25,9 @@ std::vector<RuleMatch> match_rules(const file_event &e);
 std::vector<RuleMatch> match_rules(const net_event &e);
 std::vector<RuleMatch> match_rules(const ptrace_event &e);
 std::vector<RuleMatch> match_rules(const memory_event &e);
+std::vector<RuleMatch> match_rules(const memfd_event  &e);
+std::vector<RuleMatch> match_rules(const dns_event    &e);
+std::vector<RuleMatch> match_rules(const ns_event     &e);
 
 /*
  * 프로세스 트리 컨텍스트 포함 버전.
@@ -31,6 +35,13 @@ std::vector<RuleMatch> match_rules(const memory_event &e);
  * 기본 match_rules(e) 결과에 R-011/R-012 를 추가 검사한다.
  */
 std::vector<RuleMatch> match_rules(const process_event &e, const char *parent_comm);
+
+/*
+ * init_rules(): RuleConfig 로 룰 데이터베이스를 초기화한다.
+ * 반드시 match_rules() 호출 전에 한 번 호출해야 한다.
+ * 호출하지 않으면 모든 룰 목록이 비어 있어 탐지가 이루어지지 않는다.
+ */
+void init_rules(const RuleConfig &cfg);
 
 /* severity 문자열 → ANSI 색상 코드 반환 */
 const char *severity_color(const char *severity);

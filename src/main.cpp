@@ -36,7 +36,9 @@
 #include <cstdio>
 #include <cstring>
 #include <pwd.h>
+#include <sched.h>     /* CLONE_NEW* 상수 */
 #include <string>
+#include <sys/stat.h>  /* stat(): /proc/1/ns/pid inode 읽기 */
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -48,18 +50,23 @@
 #include "file_monitor.skel.h"
 #include "network_monitor.skel.h"
 #include "memory_monitor.skel.h"
+#include "dns_monitor.skel.h"
+#include "ns_monitor.skel.h"
 #include "common.h"
 #include "rules/rule_engine.h"
+#include "rules/rule_config.h"
 #include "output/json_fmt.h"
 #include "output/http_reporter.h"
 #include "proc_tree.h"
+#include "correlation/correlator.h"
 
 /* ── 전역 상태 ─────────────────────────────────────────────────────────── */
 
-static volatile bool g_running = true;
-static FILE         *g_logfile  = nullptr;
-static HttpReporter *g_reporter = nullptr;
-static ProcTree      g_proc_tree;
+static volatile bool      g_running    = true;
+static FILE              *g_logfile    = nullptr;
+static HttpReporter      *g_reporter   = nullptr;
+static ProcTree           g_proc_tree;
+static CorrelationEngine  g_correlator;
 
 /*
  * 알림 중복 억제 (dedup):
@@ -100,7 +107,7 @@ static const char *uid_name(uint32_t uid)
 
 /* ── 세션 통계 ──────────────────────────────────────────────────────────── */
 
-static uint64_t g_n_proc = 0, g_n_file = 0, g_n_net = 0;
+static uint64_t g_n_proc = 0, g_n_file = 0, g_n_net = 0, g_n_mem = 0, g_n_dns = 0, g_n_ns = 0;
 static std::unordered_map<std::string, uint32_t> g_rule_counts;
 
 static std::vector<RuleMatch> dedup_alerts(std::vector<RuleMatch> hits,
@@ -130,8 +137,9 @@ static int libbpf_print_cb(enum libbpf_print_level level,
 
 /* ── 출력 헬퍼 ─────────────────────────────────────────────────────────── */
 
-#define RESET  "\033[0m"
-#define BOLD   "\033[1m"
+#define RESET   "\033[0m"
+#define BOLD    "\033[1m"
+#define MAGENTA "\033[1;35m"
 
 /* alert 배열을 터미널에 출력 */
 static void print_alerts(const std::vector<RuleMatch> &hits)
@@ -143,6 +151,18 @@ static void print_alerts(const std::vector<RuleMatch> &hits)
     }
 }
 
+/*
+ * is_tmp_path(): 임시 디렉터리 경로 판별.
+ * 드로퍼 패턴(R-020/R-021) 탐지용으로 상관 분석기에 이벤트를 공급할 때 사용.
+ */
+static bool is_tmp_path(const char *path)
+{
+    return strncmp(path, "/tmp/",     5) == 0 ||
+           strncmp(path, "/dev/shm/", 9) == 0 ||
+           strncmp(path, "/var/tmp/", 9) == 0 ||
+           strncmp(path, "/run/shm/", 9) == 0;
+}
+
 /* 공통 후처리: JSON 직렬화 → 로그 파일 → HTTP 리포터 */
 static void emit(const std::string &json, bool has_alert)
 {
@@ -152,6 +172,40 @@ static void emit(const std::string &json, bool has_alert)
     }
     if (g_reporter)
         g_reporter->submit(json, has_alert);
+}
+
+/*
+ * emit_correlation(): 상관 분석 알림 출력 + JSON 전송.
+ *
+ * 일반 이벤트와 달리 두 이벤트의 조합으로 생성되므로 type="correlation" 으로 직렬화.
+ * 출력 색상: 자홍(magenta) — 단일 이벤트 알림보다 더 눈에 띄도록.
+ */
+static void emit_correlation(uint32_t pid, const char *comm, uint64_t ts_ns,
+                              const std::vector<RuleMatch> &hits)
+{
+    if (hits.empty()) return;
+
+    printf("%s[CORRL]%s %9.3fs  PID=%-6u %-16s  ▶ 상관 패턴 탐지\n",
+           MAGENTA, RESET, (double)ts_ns / 1e9, pid, comm);
+    print_alerts(hits);
+
+    char buf[64];
+    std::string j = "{\"type\":\"correlation\"";
+    snprintf(buf, sizeof(buf), "%.3f", (double)ts_ns / 1e9);
+    j += ",\"ts\":"; j += buf;
+    snprintf(buf, sizeof(buf), "%u", pid);
+    j += ",\"pid\":"; j += buf;
+    j += ",\"comm\":"; j += json_esc(comm);
+    j += ",\"alerts\":[";
+    for (size_t i = 0; i < hits.size(); ++i) {
+        if (i) j += ",";
+        j += "{\"id\":";   j += json_esc(hits[i].id);
+        j += ",\"name\":"; j += json_esc(hits[i].name);
+        j += ",\"sev\":";  j += json_esc(hits[i].severity);
+        j += "}";
+    }
+    j += "]}";
+    emit(j, true);
 }
 
 /* ── 이벤트 핸들러 ─────────────────────────────────────────────────────── */
@@ -194,6 +248,12 @@ static int handle_proc_event(void *, void *data, size_t sz)
 
     print_alerts(hits);
     emit(to_json(e, hits), alert);
+
+    /* 상관 분석: /tmp 경로 실행은 드로퍼 패턴의 핵심 지표 */
+    if (is_tmp_path(e.filename)) {
+        auto ch = g_correlator.feed(e.pid, CorrelEvt::EXEC_TMP, e.ts_ns);
+        emit_correlation(e.pid, e.comm, e.ts_ns, ch);
+    }
     return 0;
 }
 
@@ -237,6 +297,12 @@ static int handle_file_event(void *, void *data, size_t sz)
 
     print_alerts(hits);
     emit(to_json(e, hits), alert);
+
+    /* 상관 분석: /tmp 쓰기는 다운로드+실행 패턴의 첫 단계 */
+    if (e.type == EVENT_FILE_WRITE && is_tmp_path(e.path)) {
+        auto ch = g_correlator.feed(e.pid, CorrelEvt::WRITE_TMP, e.ts_ns);
+        emit_correlation(e.pid, e.comm, e.ts_ns, ch);
+    }
     return 0;
 }
 
@@ -273,6 +339,12 @@ static int handle_net_event(void *, void *data, size_t sz)
 
     print_alerts(hits);
     emit(to_json(e, hits), alert);
+
+    /* 상관 분석: 아웃바운드 연결은 C2 체크인의 공통 지표 */
+    if (e.type == EVENT_NET_CONNECT) {
+        auto ch = g_correlator.feed(e.pid, CorrelEvt::NET_CONN, e.ts_ns);
+        emit_correlation(e.pid, e.comm, e.ts_ns, ch);
+    }
     return 0;
 }
 
@@ -281,6 +353,7 @@ static int handle_exit_event(void *, void *data, size_t sz)
     if (sz < sizeof(exit_event)) return 0;
     const auto &e = *static_cast<const exit_event *>(data);
     g_proc_tree.remove(e.pid);
+    g_correlator.remove(e.pid);  /* 종료된 PID 히스토리 정리 */
     return 0;
 }
 
@@ -299,6 +372,12 @@ static int handle_ptrace_event(void *, void *data, size_t sz)
 
     print_alerts(hits);
     emit(to_json(e, hits), alert);
+
+    /* 상관 분석: ptrace 는 인젝션 체인(R-019)의 핵심 지표 */
+    {
+        auto ch = g_correlator.feed(e.pid, CorrelEvt::PTRACE, e.ts_ns);
+        emit_correlation(e.pid, e.comm, e.ts_ns, ch);
+    }
     return 0;
 }
 
@@ -309,12 +388,105 @@ static int handle_mem_event(void *, void *data, size_t sz)
 
     auto hits = dedup_alerts(match_rules(e), e.comm, e.ts_ns);
     bool alert = !hits.empty();
-    // Use proc counter for simplicity, or we can create g_n_mem
-    g_n_proc++; 
+    g_n_mem++;
     for (const auto &h : hits) g_rule_counts[h.id]++;
 
     printf("[MEM  ] %9.3fs  PID=%-6u %-12s  %-16s  %s (prot=%u)\n",
-           (double)e.ts_ns / 1e9, e.pid, uid_name(e.uid), e.comm, e.is_mprotect ? "mprotect" : "mmap", e.prot);
+           (double)e.ts_ns / 1e9, e.pid, uid_name(e.uid), e.comm,
+           e.is_mprotect ? "mprotect" : "mmap", e.prot);
+
+    print_alerts(hits);
+    emit(to_json(e, hits), alert);
+
+    /* 상관 분석: RWX 메모리 할당은 파일리스 C2(R-022)의 지표 */
+    {
+        auto ch = g_correlator.feed(e.pid, CorrelEvt::MEM_RWX, e.ts_ns);
+        emit_correlation(e.pid, e.comm, e.ts_ns, ch);
+    }
+    return 0;
+}
+
+static int handle_dns_event(void *, void *data, size_t sz)
+{
+    if (sz < sizeof(dns_event)) return 0;
+    const auto &e = *static_cast<const dns_event *>(data);
+
+    /*
+     * DNS 이벤트는 빈도가 매우 높다 (브라우저 하나만 켜도 수백 건/분).
+     * alert 없는 이벤트는 stdout 출력을 생략해 노이즈를 줄인다.
+     */
+    auto hits = dedup_alerts(match_rules(e), e.comm, e.ts_ns);
+    bool alert = !hits.empty();
+    g_n_dns++;
+    for (const auto &h : hits) g_rule_counts[h.id]++;
+
+    if (alert) {
+        printf("[DNS  ] %9.3fs  PID=%-6u %-12s  %-16s  %s\n",
+               (double)e.ts_ns / 1e9, e.pid, uid_name(e.uid), e.comm, e.name);
+        print_alerts(hits);
+    }
+
+    emit(to_json(e, hits), alert);
+
+    /* 상관 분석: 의심 DNS 조회는 C2 비콘(R-023)의 첫 단계 */
+    if (alert) {
+        auto ch = g_correlator.feed(e.pid, CorrelEvt::DNS_SUSP, e.ts_ns);
+        emit_correlation(e.pid, e.comm, e.ts_ns, ch);
+    }
+    return 0;
+}
+
+static int handle_memfd_event(void *, void *data, size_t sz)
+{
+    if (sz < sizeof(memfd_event)) return 0;
+    const auto &e = *static_cast<const memfd_event *>(data);
+
+    auto hits = dedup_alerts(match_rules(e), e.comm, e.ts_ns);
+    bool alert = !hits.empty();
+    g_n_mem++;
+    for (const auto &h : hits) g_rule_counts[h.id]++;
+
+    printf("[MEMFD] %9.3fs  PID=%-6u %-12s  %-16s  name=%s flags=0x%x\n",
+           (double)e.ts_ns / 1e9, e.pid, uid_name(e.uid), e.comm,
+           e.name[0] ? e.name : "(empty)", e.flags);
+
+    print_alerts(hits);
+    emit(to_json(e, hits), alert);
+
+    /* 상관 분석: memfd 는 인젝션 체인(R-019)의 핵심 지표 */
+    {
+        auto ch = g_correlator.feed(e.pid, CorrelEvt::MEMFD, e.ts_ns);
+        emit_correlation(e.pid, e.comm, e.ts_ns, ch);
+    }
+    return 0;
+}
+
+static int handle_ns_event(void *, void *data, size_t sz)
+{
+    if (sz < sizeof(ns_event)) return 0;
+    const auto &e = *static_cast<const ns_event *>(data);
+
+    auto hits = dedup_alerts(match_rules(e), e.comm, e.ts_ns);
+    bool alert = !hits.empty();
+    g_n_ns++;
+    for (const auto &h : hits) g_rule_counts[h.id]++;
+
+    /* unshare() 에 설정된 네임스페이스 플래그 이름 조합 */
+    std::string ns_names;
+    if (e.flags & CLONE_NEWUSER)   ns_names += "user ";
+    if (e.flags & CLONE_NEWPID)    ns_names += "pid ";
+    if (e.flags & CLONE_NEWNS)     ns_names += "mnt ";
+    if (e.flags & CLONE_NEWNET)    ns_names += "net ";
+    if (e.flags & CLONE_NEWIPC)    ns_names += "ipc ";
+    if (e.flags & CLONE_NEWUTS)    ns_names += "uts ";
+    if (e.flags & CLONE_NEWCGROUP) ns_names += "cgroup ";
+    if (!ns_names.empty() && ns_names.back() == ' ')
+        ns_names.pop_back();
+
+    printf("[UNSHR] %9.3fs  PID=%-6u %-12s  %-16s  ns=[%s]%s\n",
+           (double)e.ts_ns / 1e9, e.pid, uid_name(e.uid), e.comm,
+           ns_names.c_str(),
+           e.in_container ? "  \033[1;31m[IN CONTAINER]\033[0m" : "");
 
     print_alerts(hits);
     emit(to_json(e, hits), alert);
@@ -350,6 +522,7 @@ static void print_usage(const char *prog)
         "  --endpoint URL     HTTP 전송 엔드포인트  (예: http://localhost:8888)\n"
         "  --token    TOKEN   Bearer 인증 토큰\n"
         "  --log      FILE    NDJSON 이벤트 로그 파일 경로\n"
+        "  --rules    FILE    YAML 룰 설정 파일 (기본값: 내장 기본값 사용)\n"
         "  --alerts-only      HTTP 전송: alert 있는 이벤트만 전송\n"
         "  --help             이 도움말\n", prog);
 }
@@ -357,24 +530,26 @@ static void print_usage(const char *prog)
 int main(int argc, char **argv)
 {
     /* ── 인자 파싱 ────────────────────────────────────────────────────── */
-    std::string endpoint, token, logpath;
+    std::string endpoint, token, logpath, rulespath;
     bool alerts_only = false;
 
     static const option longopts[] = {
         {"endpoint",    required_argument, nullptr, 'e'},
         {"token",       required_argument, nullptr, 't'},
         {"log",         required_argument, nullptr, 'l'},
+        {"rules",       required_argument, nullptr, 'r'},
         {"alerts-only", no_argument,       nullptr, 'a'},
         {"help",        no_argument,       nullptr, 'h'},
         {nullptr, 0, nullptr, 0}
     };
 
     int opt;
-    while ((opt = getopt_long(argc, argv, "e:t:l:ah", longopts, nullptr)) != -1) {
+    while ((opt = getopt_long(argc, argv, "e:t:l:r:ah", longopts, nullptr)) != -1) {
         switch (opt) {
         case 'e': endpoint    = optarg; break;
         case 't': token       = optarg; break;
         case 'l': logpath     = optarg; break;
+        case 'r': rulespath   = optarg; break;
         case 'a': alerts_only = true;   break;
         case 'h': print_usage(argv[0]); return 0;
         default:  print_usage(argv[0]); return 1;
@@ -393,6 +568,32 @@ int main(int argc, char **argv)
     HttpReporter reporter(endpoint, token, alerts_only);
     if (reporter.active()) g_reporter = &reporter;
 
+    /* ── 룰 초기화 ──────────────────────────────────────────────────────
+     *
+     * 1. 내장 기본값으로 초기화 (항상 수행)
+     * 2. --rules FILE 이 지정된 경우 YAML 파일로 덮어씀
+     *
+     * load() 가 false 를 반환(파일 없음)해도 기본값이 이미 로드되어 있으므로
+     * 계속 실행할 수 있다.
+     */
+    RuleConfig g_rules;
+    if (!rulespath.empty()) {
+        /*
+         * --rules 지정 시: YAML 파일로 완전 교체.
+         * 파일 열기 실패 시에만 기본값으로 폴백.
+         */
+        if (g_rules.load(rulespath))
+            fprintf(stderr, "[*] 룰 설정 로드: %s\n", rulespath.c_str());
+        else {
+            fprintf(stderr, "[!] 룰 파일 열기 실패: %s — 내장 기본값 사용\n",
+                    rulespath.c_str());
+            g_rules.load_defaults();
+        }
+    } else {
+        g_rules.load_defaults();
+    }
+    init_rules(g_rules);
+
     /* ── 시그널 & libbpf ──────────────────────────────────────────────── */
     signal(SIGINT,  sig_handler);
     signal(SIGTERM, sig_handler);
@@ -403,6 +604,8 @@ int main(int argc, char **argv)
     file_monitor_bpf    *file_skel = nullptr;
     network_monitor_bpf *net_skel  = nullptr;
     memory_monitor_bpf  *mem_skel  = nullptr;
+    dns_monitor_bpf     *dns_skel  = nullptr;
+    ns_monitor_bpf      *ns_skel   = nullptr;
     ring_buffer         *rb        = nullptr;
     int err = 0;
 
@@ -426,6 +629,37 @@ int main(int argc, char **argv)
             memory_monitor_bpf__load,
             memory_monitor_bpf__attach)) < 0) goto cleanup;
 
+    if ((err = load_and_attach(&dns_skel, "dns_monitor",
+            dns_monitor_bpf__open,
+            dns_monitor_bpf__load,
+            dns_monitor_bpf__attach)) < 0) goto cleanup;
+
+    if ((err = load_and_attach(&ns_skel, "ns_monitor",
+            ns_monitor_bpf__open,
+            ns_monitor_bpf__load,
+            ns_monitor_bpf__attach)) < 0) goto cleanup;
+
+    /*
+     * init PID 네임스페이스 inum 을 BPF 맵에 기록.
+     *
+     * /proc/1/ns/pid 는 init 프로세스의 PID 네임스페이스를 가리키는 심볼릭 링크다.
+     * stat() 로 inode 번호를 읽어 BPF 맵(init_pid_ns_inum)에 저장하면,
+     * BPF 훅이 현재 프로세스의 PID ns inode 와 비교해 컨테이너 여부를 판단한다.
+     */
+    {
+        struct stat ns_st;
+        if (stat("/proc/1/ns/pid", &ns_st) == 0) {
+            uint64_t inum = (uint64_t)ns_st.st_ino;
+            uint32_t key  = 0;
+            bpf_map__update_elem(ns_skel->maps.init_pid_ns_inum,
+                                 &key, sizeof(key),
+                                 &inum, sizeof(inum), BPF_ANY);
+            fprintf(stderr, "[*] init PID ns inum: %" PRIu64 "\n", inum);
+        } else {
+            fprintf(stderr, "[!] /proc/1/ns/pid stat 실패: %s\n", strerror(errno));
+        }
+    }
+
     /* ── 통합 링버퍼 폴러 ─────────────────────────────────────────────── */
     rb = ring_buffer__new(bpf_map__fd(proc_skel->maps.rb),
                           handle_proc_event, nullptr, nullptr);
@@ -440,7 +674,13 @@ int main(int argc, char **argv)
     if ((err = ring_buffer__add(rb, bpf_map__fd(proc_skel->maps.rb_ptrace),
                                 handle_ptrace_event, nullptr)) < 0) goto cleanup;
     if ((err = ring_buffer__add(rb, bpf_map__fd(mem_skel->maps.rb_mem),
-                                handle_mem_event, nullptr)) < 0) goto cleanup;
+                                handle_mem_event,   nullptr)) < 0) goto cleanup;
+    if ((err = ring_buffer__add(rb, bpf_map__fd(mem_skel->maps.rb_memfd),
+                                handle_memfd_event, nullptr)) < 0) goto cleanup;
+    if ((err = ring_buffer__add(rb, bpf_map__fd(dns_skel->maps.rb_dns),
+                                handle_dns_event,   nullptr)) < 0) goto cleanup;
+    if ((err = ring_buffer__add(rb, bpf_map__fd(ns_skel->maps.rb_ns),
+                                handle_ns_event,    nullptr)) < 0) goto cleanup;
 
     /* ── 프로세스 트리 초기화 ────────────────────────────────────────────
      *
@@ -474,10 +714,13 @@ int main(int argc, char **argv)
     if (g_reporter) g_reporter->flush();
 
     /* ── 세션 통계 출력 ────────────────────────────────────────────────── */
-    uint64_t total = g_n_proc + g_n_file + g_n_net;
+    uint64_t total = g_n_proc + g_n_file + g_n_net + g_n_mem + g_n_dns + g_n_ns;
     printf("\n" BOLD "=== 세션 통계 ===\n" RESET);
-    printf("총 이벤트: %" PRIu64 "  (EXEC=%" PRIu64 "  FILE=%" PRIu64 "  NET=%" PRIu64 ")\n",
-           total, g_n_proc, g_n_file, g_n_net);
+    printf("총 이벤트: %" PRIu64
+           "  (EXEC=%" PRIu64 "  FILE=%" PRIu64
+           "  NET=%" PRIu64 "  MEM=%" PRIu64
+           "  DNS=%" PRIu64 "  NS=%" PRIu64 ")\n",
+           total, g_n_proc, g_n_file, g_n_net, g_n_mem, g_n_dns, g_n_ns);
 
     if (!g_rule_counts.empty()) {
         printf("\n%-10s  %s\n", "룰", "발화 횟수");
@@ -494,6 +737,8 @@ int main(int argc, char **argv)
 
 cleanup:
     ring_buffer__free(rb);
+    ns_monitor_bpf__destroy(ns_skel);
+    dns_monitor_bpf__destroy(dns_skel);
     memory_monitor_bpf__destroy(mem_skel);
     network_monitor_bpf__destroy(net_skel);
     file_monitor_bpf__destroy(file_skel);
