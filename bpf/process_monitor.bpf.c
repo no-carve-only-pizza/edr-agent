@@ -288,71 +288,43 @@ int handle_sys_execve(struct trace_event_raw_sys_enter *ctx)
     __u32         pid      = (__u32)(bpf_get_current_pid_tgid() >> 32);
     const char  **argv_user = (const char **)ctx->args[1];
 
-    /*
-     * argv_cache_t 를 BPF 스택에 선언.
-     * = {} 로 제로 초기화: BPF 검증기가 "uninitialized read" 를 감지하지 않도록.
-     */
-    struct argv_cache_t entry = {};
+    struct argv_cache_t zero = {};
+    bpf_map_update_elem(&argv_store, &pid, &zero, BPF_ANY);
+    struct argv_cache_t *entry = bpf_map_lookup_elem(&argv_store, &pid);
+    if (!entry) return 0;
+
     __u32 off = 0;
 
     /*
      * #pragma unroll: 컴파일러가 루프를 MAX_ARGC 번 완전 전개(unroll).
-     *
-     * BPF 검증기는 루프 반복 횟수가 정적으로 결정된 경우에만 분석 가능하다.
-     * Linux 5.3+ 에서는 bounded loop 도 지원하지만, unroll 이 더 안전하다.
-     * (검증기가 각 반복의 레지스터 범위를 독립적으로 추적)
-     *
-     * 각 반복에서:
-     *   1. argv_user[i] (유저 포인터) 읽기 → bpf_probe_read_user()
-     *      NULL = argv 배열 끝 → break
-     *   2. 유저 문자열 읽기 → bpf_probe_read_user_str()
-     *      반환값 r: 복사된 바이트 수 (NUL 포함). 실패 = 음수.
-     *   3. off 증가 및 경계 검사
      */
     #pragma unroll
     for (int i = 0; i < MAX_ARGC; i++) {
         const char *arg = NULL;
 
-        /* argv[i] 포인터 자체를 유저 메모리에서 읽음 */
         if (bpf_probe_read_user(&arg, sizeof(arg), &argv_user[i]) < 0 || !arg)
             break;
 
-        /*
-         * 버퍼 경계 체크: off 가 MAX_ARGV_LEN - 1 이상이면 공간 없음.
-         *
-         * (off & (MAX_ARGV_LEN - 1)) 패턴:
-         *   MAX_ARGV_LEN = 256 = 2^8 이므로, AND 마스크로 [0, 255] 범위를 강제.
-         *   BPF 검증기가 배열 오프셋의 상한(upper bound)을 추적할 때
-         *   이 마스크가 없으면 "R1 min value is negative" 등의 오류 발생 가능.
-         */
         if (off >= MAX_ARGV_LEN - 1)
             break;
 
+        __u32 mask_off = off & (MAX_ARGV_LEN - 1);
+        __u32 len = MAX_ARGV_LEN - mask_off;
+        if (len > MAX_ARGV_LEN) len = MAX_ARGV_LEN; // hint to verifier
+        len &= (MAX_ARGV_LEN - 1); // another hint
+
         int r = bpf_probe_read_user_str(
-            entry.buf + (off & (MAX_ARGV_LEN - 1)),
-            MAX_ARGV_LEN - (off & (MAX_ARGV_LEN - 1)),
+            entry->buf + mask_off,
+            len,
             arg);
 
-        if (r < 0)
+        if (r <= 0)
             break;
 
-        entry.argc++;
-        off += (__u32)r; /* r에는 NUL 바이트 포함 → 다음 인자 시작 위치 */
+        entry->argc++;
+        off += (__u32)r;
     }
 
-    /*
-     * envp 스캔: LD_PRELOAD= 탐지 (R-013).
-     *
-     * LD_PRELOAD 는 공유 라이브러리 인젝션의 전형적 기법이다.
-     *   - 공격자: LD_PRELOAD=/tmp/evil.so ls  → evil.so 의 심볼이 우선 로드
-     *   - 루트킷: LD_PRELOAD 로 libc 함수 후킹(readdir, open 등 은폐)
-     *
-     * 처음 16개 환경변수만 검사한다:
-     *   LD_PRELOAD 는 보통 첫 몇 개 env 에 위치한다.
-     *   16회 #pragma unroll → BPF 검증기 복잡도 제한 내.
-     *
-     * envbuf[12]: "LD_PRELOAD=" = 11자 + NUL. 값 내용은 불필요.
-     */
     {
         const char **envp_user = (const char **)ctx->args[2];
         char envbuf[12] = {};
@@ -362,18 +334,29 @@ int handle_sys_execve(struct trace_event_raw_sys_enter *ctx)
             if (bpf_probe_read_user(&env, sizeof(env), &envp_user[i]) < 0 || !env)
                 break;
             bpf_probe_read_user_str(envbuf, sizeof(envbuf), env);
-            /* "LD_PRELOAD=" 11자 직접 비교 (strncmp 불가 - BPF 스택 경계 문제) */
             if (envbuf[0]=='L' && envbuf[1]=='D' && envbuf[2]=='_' &&
                 envbuf[3]=='P' && envbuf[4]=='R' && envbuf[5]=='E' &&
                 envbuf[6]=='L' && envbuf[7]=='O' && envbuf[8]=='A' &&
                 envbuf[9]=='D' && envbuf[10]=='=') {
-                entry.has_ld_preload = 1;
+                entry->has_ld_preload = 1;
             }
         }
     }
 
-    /* PID 를 키로 argv_store 에 저장. sched_process_exec 에서 소비. */
-    bpf_map_update_elem(&argv_store, &pid, &entry, BPF_ANY);
+    return 0;
+}
+
+/*
+ * sys_exit_execve: execve() 실패 시 argv_store 맵에 남아있는 찌꺼기 데이터 클린업
+ */
+SEC("tp/syscalls/sys_exit_execve")
+int handle_sys_execve_exit(struct trace_event_raw_sys_exit *ctx)
+{
+    long ret = ctx->ret;
+    if (ret < 0) {
+        __u32 pid = (__u32)(bpf_get_current_pid_tgid() >> 32);
+        bpf_map_delete_elem(&argv_store, &pid);
+    }
     return 0;
 }
 
@@ -464,6 +447,10 @@ int handle_exit(void *ctx)
     e->exit_code = BPF_CORE_READ(task, exit_code);
 
     bpf_ringbuf_submit(e, 0);
+
+    /* Garbage collection fallback */
+    bpf_map_delete_elem(&argv_store, &tgid);
+    
     return 0;
 }
 

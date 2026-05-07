@@ -224,3 +224,31 @@ std::string to_json(const ptrace_event &e, const std::vector<RuleMatch> &hits)
     j += "}";
     return j;
 }
+
+std::string to_json(const memory_event &e, const std::vector<RuleMatch> &hits)
+{
+    char buf[64];
+    std::string j = "{";
+
+    j += "\"type\":\"memory\"";
+
+    snprintf(buf, sizeof(buf), "%.3f", (double)e.ts_ns / 1e9);
+    j += ",\"ts\":"; j += buf;
+
+    snprintf(buf, sizeof(buf), "%u", e.pid);
+    j += ",\"pid\":"; j += buf;
+
+    snprintf(buf, sizeof(buf), "%u", e.uid);
+    j += ",\"uid\":"; j += buf;
+
+    j += ",\"comm\":"; j += json_esc(e.comm);
+
+    snprintf(buf, sizeof(buf), "%u", e.prot);
+    j += ",\"prot\":"; j += buf;
+
+    j += ",\"is_mprotect\":"; j += e.is_mprotect ? "true" : "false";
+
+    j += ",\"alerts\":"; j += alerts_json(hits);
+    j += "}";
+    return j;
+}

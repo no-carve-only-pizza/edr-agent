@@ -23,6 +23,7 @@ std::vector<RuleMatch> match_rules(const process_event &e);
 std::vector<RuleMatch> match_rules(const file_event &e);
 std::vector<RuleMatch> match_rules(const net_event &e);
 std::vector<RuleMatch> match_rules(const ptrace_event &e);
+std::vector<RuleMatch> match_rules(const memory_event &e);
 
 /*
  * 프로세스 트리 컨텍스트 포함 버전.

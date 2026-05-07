@@ -55,6 +55,11 @@ set(NET_BPF_SRC  ${CMAKE_SOURCE_DIR}/bpf/network_monitor.bpf.c)
 set(NET_BPF_OBJ  ${CMAKE_BINARY_DIR}/network_monitor.bpf.o)
 set(NET_BPF_SKEL ${CMAKE_BINARY_DIR}/network_monitor.skel.h)
 
+# memory_monitor
+set(MEM_BPF_SRC  ${CMAKE_SOURCE_DIR}/bpf/memory_monitor.bpf.c)
+set(MEM_BPF_OBJ  ${CMAKE_BINARY_DIR}/memory_monitor.bpf.o)
+set(MEM_BPF_SKEL ${CMAKE_BINARY_DIR}/memory_monitor.skel.h)
+
 # 공통 clang 플래그 (BPF 크로스 컴파일)
 set(BPF_CFLAGS
     -g -O2 -target bpf -D__TARGET_ARCH_x86
@@ -120,7 +125,23 @@ add_custom_command(
     VERBATIM
 )
 
-add_custom_target(bpf_build DEPENDS ${PROC_BPF_SKEL} ${FILE_BPF_SKEL} ${NET_BPF_SKEL})
+# ── Step B-4: memory_monitor 컴파일 & 스켈레톤 생성 ─────────────────────
+add_custom_command(
+    OUTPUT  ${MEM_BPF_OBJ}
+    COMMAND ${CLANG} ${BPF_CFLAGS} -c ${MEM_BPF_SRC} -o ${MEM_BPF_OBJ}
+    DEPENDS ${MEM_BPF_SRC} ${VMLINUX_H}
+    COMMENT "BPF 컴파일: memory_monitor.bpf.c"
+    VERBATIM
+)
+add_custom_command(
+    OUTPUT  ${MEM_BPF_SKEL}
+    COMMAND ${BPFTOOL} gen skeleton ${MEM_BPF_OBJ} > ${MEM_BPF_SKEL}
+    DEPENDS ${MEM_BPF_OBJ}
+    COMMENT "스켈레톤 생성: memory_monitor.skel.h"
+    VERBATIM
+)
+
+add_custom_target(bpf_build DEPENDS ${PROC_BPF_SKEL} ${FILE_BPF_SKEL} ${NET_BPF_SKEL} ${MEM_BPF_SKEL})
 
 # ── libcurl (마일스톤 5: HTTP 리포터) ────────────────────────────────────
 find_package(CURL REQUIRED)

@@ -175,4 +175,19 @@ struct exit_event {
     char  comm[TASK_COMM_LEN];
 };
 
+/*
+ * memory_event: mmap / mprotect 로 RWX 메모리 할당 (R-016).
+ *
+ * sys_enter_mmap 및 sys_enter_mprotect 훅에서 캡처.
+ * prot 인자에 PROT_EXEC(4) 와 PROT_WRITE(2) 가 모두 포함된 경우만 기록.
+ */
+struct memory_event {
+    __u32 pid;
+    __u32 uid;
+    __u64 ts_ns;
+    char  comm[TASK_COMM_LEN];
+    __u32 prot;         /* 요청된 권한 플래그 */
+    __u32 is_mprotect;  /* 0: mmap, 1: mprotect */
+};
+
 #endif /* EDR_COMMON_H */

@@ -47,6 +47,7 @@
 #include "process_monitor.skel.h"
 #include "file_monitor.skel.h"
 #include "network_monitor.skel.h"
+#include "memory_monitor.skel.h"
 #include "common.h"
 #include "rules/rule_engine.h"
 #include "output/json_fmt.h"
@@ -301,6 +302,25 @@ static int handle_ptrace_event(void *, void *data, size_t sz)
     return 0;
 }
 
+static int handle_mem_event(void *, void *data, size_t sz)
+{
+    if (sz < sizeof(memory_event)) return 0;
+    const auto &e = *static_cast<const memory_event *>(data);
+
+    auto hits = dedup_alerts(match_rules(e), e.comm, e.ts_ns);
+    bool alert = !hits.empty();
+    // Use proc counter for simplicity, or we can create g_n_mem
+    g_n_proc++; 
+    for (const auto &h : hits) g_rule_counts[h.id]++;
+
+    printf("[MEM  ] %9.3fs  PID=%-6u %-12s  %-16s  %s (prot=%u)\n",
+           (double)e.ts_ns / 1e9, e.pid, uid_name(e.uid), e.comm, e.is_mprotect ? "mprotect" : "mmap", e.prot);
+
+    print_alerts(hits);
+    emit(to_json(e, hits), alert);
+    return 0;
+}
+
 /* ── BPF 로드 헬퍼 (중복 제거) ─────────────────────────────────────────── */
 
 template<typename Skel>
@@ -382,6 +402,7 @@ int main(int argc, char **argv)
     process_monitor_bpf *proc_skel = nullptr;
     file_monitor_bpf    *file_skel = nullptr;
     network_monitor_bpf *net_skel  = nullptr;
+    memory_monitor_bpf  *mem_skel  = nullptr;
     ring_buffer         *rb        = nullptr;
     int err = 0;
 
@@ -400,6 +421,11 @@ int main(int argc, char **argv)
             network_monitor_bpf__load,
             network_monitor_bpf__attach)) < 0) goto cleanup;
 
+    if ((err = load_and_attach(&mem_skel, "memory_monitor",
+            memory_monitor_bpf__open,
+            memory_monitor_bpf__load,
+            memory_monitor_bpf__attach)) < 0) goto cleanup;
+
     /* ── 통합 링버퍼 폴러 ─────────────────────────────────────────────── */
     rb = ring_buffer__new(bpf_map__fd(proc_skel->maps.rb),
                           handle_proc_event, nullptr, nullptr);
@@ -413,6 +439,8 @@ int main(int argc, char **argv)
                                 handle_exit_event,   nullptr)) < 0) goto cleanup;
     if ((err = ring_buffer__add(rb, bpf_map__fd(proc_skel->maps.rb_ptrace),
                                 handle_ptrace_event, nullptr)) < 0) goto cleanup;
+    if ((err = ring_buffer__add(rb, bpf_map__fd(mem_skel->maps.rb_mem),
+                                handle_mem_event, nullptr)) < 0) goto cleanup;
 
     /* ── 프로세스 트리 초기화 ────────────────────────────────────────────
      *
@@ -466,6 +494,7 @@ int main(int argc, char **argv)
 
 cleanup:
     ring_buffer__free(rb);
+    memory_monitor_bpf__destroy(mem_skel);
     network_monitor_bpf__destroy(net_skel);
     file_monitor_bpf__destroy(file_skel);
     process_monitor_bpf__destroy(proc_skel);
