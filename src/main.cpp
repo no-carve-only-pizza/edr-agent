@@ -46,12 +46,14 @@
 #include "rules/rule_engine.h"
 #include "output/json_fmt.h"
 #include "output/http_reporter.h"
+#include "proc_tree.h"
 
 /* ── 전역 상태 ─────────────────────────────────────────────────────────── */
 
 static volatile bool g_running = true;
 static FILE         *g_logfile  = nullptr;
 static HttpReporter *g_reporter = nullptr;
+static ProcTree      g_proc_tree;
 
 static void sig_handler(int) { g_running = false; }
 
@@ -95,11 +97,22 @@ static int handle_proc_event(void *, void *data, size_t sz)
     if (sz < sizeof(process_event)) return 0;
     const auto &e = *static_cast<const process_event *>(data);
 
-    auto hits = match_rules(e);
+    /*
+     * 부모 comm 조회 → 트리 업데이트 순서가 중요하다.
+     * 조회를 먼저 해야 e.ppid 로 부모 항목을 찾을 수 있다.
+     * update() 이후에는 e.pid 가 덮여쓰일 수 있다 (PID 재사용).
+     */
+    const char *par = g_proc_tree.comm_of(e.ppid);
+    auto hits = match_rules(e, par);
     bool alert = !hits.empty();
+    g_proc_tree.update(e.pid, e.ppid, e.comm);
 
     printf("[EXEC ] %9.3fs  PID=%-6u PPID=%-6u UID=%-5u  %-16s  %s\n",
            (double)e.ts_ns / 1e9, e.pid, e.ppid, e.uid, e.comm, e.filename);
+
+    /* 부모 comm 이 알려진 경우 표시 */
+    if (par)
+        printf("        parent: %s\n", par);
 
     /* argv 출력: argc > 0 이면 캡처된 인자가 있음 */
     if (e.argc > 0) {
@@ -292,6 +305,15 @@ int main(int argc, char **argv)
                                 handle_file_event, nullptr)) < 0) goto cleanup;
     if ((err = ring_buffer__add(rb, bpf_map__fd(net_skel->maps.rb),
                                 handle_net_event,  nullptr)) < 0) goto cleanup;
+
+    /* ── 프로세스 트리 초기화 ────────────────────────────────────────────
+     *
+     * BPF 훅이 attach 되기 전부터 실행 중인 프로세스(nginx, mysqld 등)는
+     * exec 이벤트가 없으므로 트리에 자동 추가되지 않는다.
+     * /proc 스캔으로 기존 프로세스를 미리 채워 R-011/R-012 탐지를 즉시 활성화.
+     */
+    g_proc_tree.init_from_proc();
+    fprintf(stderr, "[*] 프로세스 트리 초기화: %zu 개 항목\n", g_proc_tree.size());
 
     /* ── 헤더 출력 ────────────────────────────────────────────────────── */
     printf(BOLD

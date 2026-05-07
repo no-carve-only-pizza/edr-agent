@@ -128,6 +128,7 @@ find_package(CURL REQUIRED)
 # ── 유저스페이스 실행 파일 ────────────────────────────────────────────────
 add_executable(edr-agent
     src/main.cpp
+    src/proc_tree.cpp
     src/rules/rule_engine.cpp
     src/output/json_fmt.cpp
     src/output/http_reporter.cpp

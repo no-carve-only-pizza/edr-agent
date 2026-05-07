@@ -23,5 +23,12 @@ std::vector<RuleMatch> match_rules(const process_event &e);
 std::vector<RuleMatch> match_rules(const file_event &e);
 std::vector<RuleMatch> match_rules(const net_event &e);
 
+/*
+ * 프로세스 트리 컨텍스트 포함 버전.
+ * parent_comm: 부모 프로세스의 comm (nullptr/빈 문자열이면 기본 버전과 동일).
+ * 기본 match_rules(e) 결과에 R-011/R-012 를 추가 검사한다.
+ */
+std::vector<RuleMatch> match_rules(const process_event &e, const char *parent_comm);
+
 /* severity 문자열 → ANSI 색상 코드 반환 */
 const char *severity_color(const char *severity);
