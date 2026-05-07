@@ -9,6 +9,7 @@
  */
 #include "output/json_fmt.h"
 #include <arpa/inet.h>
+#include <cinttypes>
 #include <cstdio>
 #include <cstring>
 
@@ -225,6 +226,62 @@ std::string to_json(const ptrace_event &e, const std::vector<RuleMatch> &hits)
     return j;
 }
 
+std::string to_json(const memfd_event &e, const std::vector<RuleMatch> &hits)
+{
+    char buf[64];
+    std::string j = "{";
+
+    j += "\"type\":\"memfd\"";
+
+    snprintf(buf, sizeof(buf), "%.3f", (double)e.ts_ns / 1e9);
+    j += ",\"ts\":"; j += buf;
+
+    snprintf(buf, sizeof(buf), "%u", e.pid);
+    j += ",\"pid\":"; j += buf;
+
+    snprintf(buf, sizeof(buf), "%u", e.uid);
+    j += ",\"uid\":"; j += buf;
+
+    j += ",\"comm\":"; j += json_esc(e.comm);
+    j += ",\"name\":"; j += json_esc(e.name);
+
+    snprintf(buf, sizeof(buf), "%u", e.flags);
+    j += ",\"flags\":"; j += buf;
+
+    j += ",\"sealing\":"; j += (e.flags & 0x2) ? "true" : "false";
+
+    j += ",\"alerts\":"; j += alerts_json(hits);
+    j += "}";
+    return j;
+}
+
+std::string to_json(const dns_event &e, const std::vector<RuleMatch> &hits)
+{
+    char buf[64];
+    std::string j = "{";
+
+    j += "\"type\":\"dns\"";
+
+    snprintf(buf, sizeof(buf), "%.3f", (double)e.ts_ns / 1e9);
+    j += ",\"ts\":"; j += buf;
+
+    snprintf(buf, sizeof(buf), "%u", e.pid);
+    j += ",\"pid\":"; j += buf;
+
+    snprintf(buf, sizeof(buf), "%u", e.uid);
+    j += ",\"uid\":"; j += buf;
+
+    j += ",\"comm\":";   j += json_esc(e.comm);
+    j += ",\"query\":";  j += json_esc(e.name);
+
+    j += ",\"server\":"; j += json_esc(ip_str(e.server, e.family).c_str());
+    j += ",\"family\":"; j += (e.family == 10) ? "\"ipv6\"" : "\"ipv4\"";
+
+    j += ",\"alerts\":"; j += alerts_json(hits);
+    j += "}";
+    return j;
+}
+
 std::string to_json(const memory_event &e, const std::vector<RuleMatch> &hits)
 {
     char buf[64];
@@ -247,6 +304,37 @@ std::string to_json(const memory_event &e, const std::vector<RuleMatch> &hits)
     j += ",\"prot\":"; j += buf;
 
     j += ",\"is_mprotect\":"; j += e.is_mprotect ? "true" : "false";
+
+    j += ",\"alerts\":"; j += alerts_json(hits);
+    j += "}";
+    return j;
+}
+
+std::string to_json(const ns_event &e, const std::vector<RuleMatch> &hits)
+{
+    char buf[64];
+    std::string j = "{";
+
+    j += "\"type\":\"ns_unshare\"";
+
+    snprintf(buf, sizeof(buf), "%.3f", (double)e.ts_ns / 1e9);
+    j += ",\"ts\":"; j += buf;
+
+    snprintf(buf, sizeof(buf), "%u", e.pid);
+    j += ",\"pid\":"; j += buf;
+
+    snprintf(buf, sizeof(buf), "%u", e.uid);
+    j += ",\"uid\":"; j += buf;
+
+    j += ",\"comm\":"; j += json_esc(e.comm);
+
+    snprintf(buf, sizeof(buf), "%" PRIu64, (uint64_t)e.ns_inum);
+    j += ",\"ns_inum\":"; j += buf;
+
+    snprintf(buf, sizeof(buf), "0x%x", e.flags);
+    j += ",\"flags\":"; j += json_esc(buf);
+
+    j += ",\"in_container\":"; j += e.in_container ? "true" : "false";
 
     j += ",\"alerts\":"; j += alerts_json(hits);
     j += "}";

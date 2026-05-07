@@ -296,7 +296,8 @@ int handle_sys_execve(struct trace_event_raw_sys_enter *ctx)
     __u32 off = 0;
 
     /*
-     * #pragma unroll: 컴파일러가 루프를 MAX_ARGC 번 완전 전개(unroll).
+     * #pragma unroll: BPF 검증기는 루프 반복 횟수를 정적으로 결정해야 한다.
+     * 루프를 완전 전개하면 검증기가 각 반복 경로를 독립적으로 추적할 수 있다.
      */
     #pragma unroll
     for (int i = 0; i < MAX_ARGC; i++) {
@@ -308,10 +309,23 @@ int handle_sys_execve(struct trace_event_raw_sys_enter *ctx)
         if (off >= MAX_ARGV_LEN - 1)
             break;
 
+        /*
+         * BPF 검증기 경계 증명: 배열 접근 전 인덱스가 범위 내임을 증명해야 한다.
+         *
+         * off 가 MAX_ARGV_LEN 미만임을 위에서 확인했어도 검증기가 이 정보를
+         * 다음 명령으로 전파하지 못하는 경우가 있다.
+         *
+         * off & (MAX_ARGV_LEN - 1): MAX_ARGV_LEN 이 2의 거듭제곱(256)이면
+         *   비트 AND 로 상위 비트를 모두 제거 → 결과가 반드시 [0, 255] 범위임을
+         *   검증기가 비트마스크 범위 추론으로 정적 증명 가능.
+         *
+         * len 이중 제한: 읽을 크기도 [0, MAX_ARGV_LEN] 로 제한해야
+         *   entry->buf + mask_off + len 이 배열 끝을 넘지 않음을 증명.
+         */
         __u32 mask_off = off & (MAX_ARGV_LEN - 1);
         __u32 len = MAX_ARGV_LEN - mask_off;
-        if (len > MAX_ARGV_LEN) len = MAX_ARGV_LEN; // hint to verifier
-        len &= (MAX_ARGV_LEN - 1); // another hint
+        if (len > MAX_ARGV_LEN) len = MAX_ARGV_LEN;
+        len &= (MAX_ARGV_LEN - 1);
 
         int r = bpf_probe_read_user_str(
             entry->buf + mask_off,
@@ -325,6 +339,22 @@ int handle_sys_execve(struct trace_event_raw_sys_enter *ctx)
         off += (__u32)r;
     }
 
+    /*
+     * envp 스캔: LD_PRELOAD 환경변수 존재 여부 탐지 (R-013).
+     *
+     * LD_PRELOAD 는 동적 링커(ld.so)가 프로세스 시작 전에 지정 공유 라이브러리를
+     * 강제 로드하는 메커니즘으로, 다음 공격에 악용된다:
+     *   - libc 함수 후킹: open(), read(), write() 등 오버라이드
+     *   - 루트킷 은닉: readdir() 교체로 파일·디렉터리 숨기기
+     *   - 자격증명 탈취: PAM 함수 교체로 비밀번호 가로채기
+     *
+     * char-by-char 비교를 사용하는 이유:
+     *   BPF 에서는 유저 포인터를 strncmp() 에 직접 전달할 수 없다.
+     *   bpf_probe_read_user_str() 로 커널 버퍼에 먼저 복사한 뒤
+     *   정적으로 알려진 "LD_PRELOAD="(11자)와 바이트 단위로 비교한다.
+     *
+     * 앞 16개 항목만 검사: 검증기 복잡도와 탐지 커버리지 간의 트레이드오프.
+     */
     {
         const char **envp_user = (const char **)ctx->args[2];
         char envbuf[12] = {};
@@ -360,11 +390,6 @@ int handle_sys_execve_exit(struct trace_event_raw_sys_exit *ctx)
     return 0;
 }
 
-/*
- * BPF 라이선스 선언: GPL 호환 라이선스가 선언된 프로그램만
- * bpf_probe_read_kernel() 등 "GPL only" helper를 사용할 수 있다.
- * 커널이 bpf(BPF_PROG_LOAD) 시 이 필드를 검사한다.
- */
 /*
  * sys_enter_ptrace: ptrace() ATTACH 감지 (R-014).
  *
@@ -448,10 +473,15 @@ int handle_exit(void *ctx)
 
     bpf_ringbuf_submit(e, 0);
 
-    /* Garbage collection fallback */
+    /* GC 폴백: execve 실패 시 남아있을 수 있는 argv_store 찌꺼기 삭제 */
     bpf_map_delete_elem(&argv_store, &tgid);
     
     return 0;
 }
 
+/*
+ * BPF 라이선스 선언: GPL 호환 라이선스가 선언된 프로그램만
+ * bpf_probe_read_kernel() 등 "GPL only" helper를 사용할 수 있다.
+ * 커널이 bpf(BPF_PROG_LOAD) 시 이 필드를 검사한다.
+ */
 char LICENSE[] SEC("license") = "GPL";

