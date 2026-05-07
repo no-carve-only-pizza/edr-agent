@@ -216,6 +216,7 @@ memfd_whitelist:
   - java
   - node
   - nodejs
+  - chrome
   - qemu-system-x86
   - qemu-system-arm
   - qemu-kvm

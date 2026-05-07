@@ -205,7 +205,7 @@ void RuleConfig::load_defaults()
     memfd_whitelist     = {"java", "node", "nodejs",
                            "qemu-system-x86", "qemu-system-arm", "qemu-kvm",
                            "systemd",
-                           "firefox", "chromium", "chromium-browse",
+                           "firefox", "chrome", "chromium", "chromium-browse",
                            "Xwayland"};
 
     dns_whitelist       = {"systemd-resolve", "avahi-daemon"};
