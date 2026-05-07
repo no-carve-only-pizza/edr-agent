@@ -56,6 +56,36 @@ struct {
 } rb SEC(".maps");
 
 /*
+ * argv_store: sys_enter_execve → sched_process_exec 데이터 전달 채널.
+ *
+ * 두 훅이 왜 분리되어 있는가:
+ *   - sys_enter_execve: argv 포인터 배열이 아직 유저 스택에 있어 읽기 가능.
+ *     그러나 execve() 가 성공한다는 보장이 없다 (ENOENT, EACCES 등).
+ *   - sched_process_exec: execve() 성공이 보장되고 경로가 커널에 의해 해석된다.
+ *     그러나 이 시점에서는 이미 원본 argv 를 읽을 수 없다.
+ *
+ * 따라서 PID 를 키로 두 훅 사이에 임시 버퍼를 공유한다.
+ *
+ * 생명주기:
+ *   insert: sys_enter_execve (execve 시도 시)
+ *   delete: sched_process_exec (execve 성공 시, 이벤트에 복사 후 삭제)
+ *   누락:   execve 실패 시 엔트리가 남지만, 같은 PID 의 다음 execve 가 덮어쓴다.
+ */
+
+/* BPF 내부 전용 - argv 임시 저장소 값 타입 (common.h 에는 노출 불필요) */
+struct argv_cache_t {
+    char  buf[MAX_ARGV_LEN]; /* NUL 구분 argv 연결: /proc/PID/cmdline 형식 */
+    __u32 argc;              /* 실제 저장된 인자 수                         */
+};
+
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 4096); /* 동시 최대 execve 진행 수 (PID 수 기준) */
+    __type(key,   __u32);      /* PID (유저스페이스 기준 TGID)            */
+    __type(value, struct argv_cache_t);
+} argv_store SEC(".maps");
+
+/*
  * SEC("tp/sched/sched_process_exec")
  *
  * 트레이스포인트 명명 규칙: "tp/<category>/<name>"
@@ -81,8 +111,8 @@ int handle_exec(struct trace_event_raw_sched_process_exec *ctx)
     /* ── 1. 링버퍼 슬롯 예약 ─────────────────────────────────────────────
      *
      * BPF 프로그램의 스택 한계는 512 바이트.
-     * struct process_event 크기(약 296B)를 스택에 놓으면 한계에 근접하므로
-     * 링버퍼에서 메모리를 빌리는 것이 안전하다.
+     * struct process_event 크기(약 556B)를 스택에 놓으면 한계를 초과하므로
+     * 링버퍼에서 메모리를 빌리는 것이 필수다.
      *
      * bpf_ringbuf_reserve()는 원자적 포인터 이동(xadd)으로 O(1) 확보.
      * 버퍼가 가득 찬 경우 NULL을 반환 → 이벤트 드롭 (손실 허용 설계).
@@ -129,8 +159,6 @@ int handle_exec(struct trace_event_raw_sched_process_exec *ctx)
     uid_gid = bpf_get_current_uid_gid();
     e->uid  = (__u32)uid_gid;
 
-    e->_pad = 0;
-
     /* ── 4. 타임스탬프 ───────────────────────────────────────────────────
      *
      * bpf_ktime_get_ns(): CLOCK_MONOTONIC 기반, 시스템 부팅 이후 나노초.
@@ -170,7 +198,30 @@ int handle_exec(struct trace_event_raw_sched_process_exec *ctx)
     bpf_probe_read_kernel_str(&e->filename, sizeof(e->filename),
                                (void *)ctx + fname_off);
 
-    /* ── 7. 링버퍼 제출 ──────────────────────────────────────────────────
+    /* ── 7. argv 병합: sys_enter_execve 에서 미리 저장한 데이터 소비 ────
+     *
+     * 흐름: sys_enter_execve → argv_store[pid] 저장 → (exec 성공 시)
+     *       sched_process_exec → argv_store[pid] 조회·복사 → 맵에서 삭제.
+     *
+     * bpf_map_lookup_elem(): 성공 시 맵 값에 대한 직접 포인터 반환.
+     *   반환된 포인터는 커널 메모리를 직접 가리키므로
+     *   bpf_probe_read_kernel 없이 __builtin_memcpy 로 읽을 수 있다.
+     *
+     * 맵 조회 실패(execveat 경유, 경쟁 조건 등): e->argc = 0 으로 미캡처 표시.
+     */
+    {
+        __u32 pid_key = e->pid;
+        struct argv_cache_t *av = bpf_map_lookup_elem(&argv_store, &pid_key);
+        if (av) {
+            __builtin_memcpy(e->argv, av->buf, MAX_ARGV_LEN);
+            e->argc = av->argc;
+            bpf_map_delete_elem(&argv_store, &pid_key);
+        } else {
+            e->argc = 0;
+        }
+    }
+
+    /* ── 8. 링버퍼 제출 ──────────────────────────────────────────────────
      *
      * bpf_ringbuf_submit()은 슬롯의 헤더 비트를 "소비 가능" 상태로 원자적으로
      * 갱신(cmpxchg)한다. 유저스페이스의 ring_buffer__poll()이 epoll_wait()로
@@ -180,6 +231,91 @@ int handle_exec(struct trace_event_raw_sched_process_exec *ctx)
      *       discard()를 사용하면 이벤트를 취소할 수 있다.
      */
     bpf_ringbuf_submit(e, 0);
+    return 0;
+}
+
+/*
+ * sys_enter_execve: execve() syscall 진입 시 argv[] 를 미리 캡처.
+ *
+ * ┌─ 왜 sys_enter_execve 인가 ───────────────────────────────────────────┐
+ * │  execve() 진입 시점(ring3→ring0 전환 직후):                         │
+ * │    - argv 포인터 배열이 아직 유저 스택/힙에 있어 읽기 가능           │
+ * │    - do_execveat_common() 이 bprm→argv 를 커널로 복사하기 전        │
+ * │                                                                       │
+ * │  sched_process_exec 시점:                                            │
+ * │    - 새 VAS 매핑 완료, 원본 유저 스택은 이미 교체됨                  │
+ * │    - argv 를 읽을 방법이 없음 → 두 훅을 조합해야 한다               │
+ * └───────────────────────────────────────────────────────────────────────┘
+ *
+ * 트레이스포인트 컨텍스트 (trace_event_raw_sys_enter):
+ *   ctx->args[0] = filename  (const char __user *)
+ *   ctx->args[1] = argv      (const char __user * const __user *)
+ *   ctx->args[2] = envp      (const char __user * const __user *)
+ *
+ * BPF 스택 사용량 추정 (~292 B < 512 B):
+ *   struct argv_cache_t entry: 260 B
+ *   지역 변수 (pid, argv_user, off, arg, r): ~32 B
+ */
+SEC("tp/syscalls/sys_enter_execve")
+int handle_sys_execve(struct trace_event_raw_sys_enter *ctx)
+{
+    __u32         pid      = (__u32)(bpf_get_current_pid_tgid() >> 32);
+    const char  **argv_user = (const char **)ctx->args[1];
+
+    /*
+     * argv_cache_t 를 BPF 스택에 선언.
+     * = {} 로 제로 초기화: BPF 검증기가 "uninitialized read" 를 감지하지 않도록.
+     */
+    struct argv_cache_t entry = {};
+    __u32 off = 0;
+
+    /*
+     * #pragma unroll: 컴파일러가 루프를 MAX_ARGC 번 완전 전개(unroll).
+     *
+     * BPF 검증기는 루프 반복 횟수가 정적으로 결정된 경우에만 분석 가능하다.
+     * Linux 5.3+ 에서는 bounded loop 도 지원하지만, unroll 이 더 안전하다.
+     * (검증기가 각 반복의 레지스터 범위를 독립적으로 추적)
+     *
+     * 각 반복에서:
+     *   1. argv_user[i] (유저 포인터) 읽기 → bpf_probe_read_user()
+     *      NULL = argv 배열 끝 → break
+     *   2. 유저 문자열 읽기 → bpf_probe_read_user_str()
+     *      반환값 r: 복사된 바이트 수 (NUL 포함). 실패 = 음수.
+     *   3. off 증가 및 경계 검사
+     */
+    #pragma unroll
+    for (int i = 0; i < MAX_ARGC; i++) {
+        const char *arg = NULL;
+
+        /* argv[i] 포인터 자체를 유저 메모리에서 읽음 */
+        if (bpf_probe_read_user(&arg, sizeof(arg), &argv_user[i]) < 0 || !arg)
+            break;
+
+        /*
+         * 버퍼 경계 체크: off 가 MAX_ARGV_LEN - 1 이상이면 공간 없음.
+         *
+         * (off & (MAX_ARGV_LEN - 1)) 패턴:
+         *   MAX_ARGV_LEN = 256 = 2^8 이므로, AND 마스크로 [0, 255] 범위를 강제.
+         *   BPF 검증기가 배열 오프셋의 상한(upper bound)을 추적할 때
+         *   이 마스크가 없으면 "R1 min value is negative" 등의 오류 발생 가능.
+         */
+        if (off >= MAX_ARGV_LEN - 1)
+            break;
+
+        int r = bpf_probe_read_user_str(
+            entry.buf + (off & (MAX_ARGV_LEN - 1)),
+            MAX_ARGV_LEN - (off & (MAX_ARGV_LEN - 1)),
+            arg);
+
+        if (r < 0)
+            break;
+
+        entry.argc++;
+        off += (__u32)r; /* r에는 NUL 바이트 포함 → 다음 인자 시작 위치 */
+    }
+
+    /* PID 를 키로 argv_store 에 저장. sched_process_exec 에서 소비. */
+    bpf_map_update_elem(&argv_store, &pid, &entry, BPF_ANY);
     return 0;
 }
 

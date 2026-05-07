@@ -101,6 +101,18 @@ static int handle_proc_event(void *, void *data, size_t sz)
     printf("[EXEC ] %9.3fs  PID=%-6u PPID=%-6u UID=%-5u  %-16s  %s\n",
            (double)e.ts_ns / 1e9, e.pid, e.ppid, e.uid, e.comm, e.filename);
 
+    /* argv 출력: argc > 0 이면 캡처된 인자가 있음 */
+    if (e.argc > 0) {
+        printf("        argv:");
+        size_t off = 0;
+        for (__u32 i = 0; i < e.argc && off < MAX_ARGV_LEN; i++) {
+            printf(" %s", e.argv + off);
+            while (off < MAX_ARGV_LEN && e.argv[off] != '\0') off++;
+            off++;
+        }
+        printf("\n");
+    }
+
     print_alerts(hits);
     emit(to_json(e, hits), alert);
     return 0;

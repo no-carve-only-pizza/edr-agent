@@ -61,6 +61,28 @@ static std::string alerts_json(const std::vector<RuleMatch> &hits)
     return s;
 }
 
+/*
+ * argv_json: process_event.argv (NUL 구분 버퍼) → JSON 배열 문자열.
+ *
+ * 입력 형식: "argv0\0argv1\0argv2\0..." (argc 개)
+ * 출력 형식: ["argv0","argv1","argv2"]
+ *
+ * argc == 0 이면 빈 배열 "[]" 반환.
+ */
+static std::string argv_json(const char *buf, __u32 argc)
+{
+    std::string s = "[";
+    size_t off = 0;
+    for (__u32 i = 0; i < argc; i++) {
+        if (off >= MAX_ARGV_LEN) break;
+        if (i) s += ',';
+        s += json_esc(buf + off);
+        while (off < MAX_ARGV_LEN && buf[off] != '\0') off++;
+        off++; /* NUL 건너뜀 */
+    }
+    return s + "]";
+}
+
 static std::string ip_str(const __u8 *addr, __u16 family)
 {
     char buf[INET6_ADDRSTRLEN] = {};
@@ -92,6 +114,7 @@ std::string to_json(const process_event &e, const std::vector<RuleMatch> &hits)
 
     j += ",\"comm\":";     j += json_esc(e.comm);
     j += ",\"path\":";     j += json_esc(e.filename);
+    j += ",\"argv\":";     j += argv_json(e.argv, e.argc);
     j += ",\"alerts\":";   j += alerts_json(hits);
     j += "}";
     return j;

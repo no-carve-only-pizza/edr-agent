@@ -29,6 +29,7 @@ sys_enter_bind
 | R-007 | 서버 포트 바인드 | low |
 | R-008 | root 권한 인터프리터 실행 | critical |
 | R-009 | `/tmp` → 시스템 경로 rename (TOCTOU 의심) | critical |
+| R-010 | 인터프리터 `-c`/`-e` 인라인 페이로드 실행 (파일리스 공격 의심) | high |
 
 ## 요구사항
 
