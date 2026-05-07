@@ -1,0 +1,7 @@
+build/
+*.o
+*.skel.h
+vmlinux.h
+compile_commands.json
+.cache/
+*.ndjson

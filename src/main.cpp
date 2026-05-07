@@ -1,0 +1,312 @@
+/*
+ * main.cpp - EDR Agent 오케스트레이터 (마일스톤 4+5 통합)
+ *
+ * ┌─ 전체 파이프라인 ───────────────────────────────────────────────────────┐
+ * │                                                                          │
+ * │  ┌──────────┐ ┌──────────┐ ┌─────────────┐                            │
+ * │  │ proc BPF │ │ file BPF │ │ network BPF │  ← 3개 BPF 프로그램        │
+ * │  └─────┬────┘ └─────┬────┘ └──────┬──────┘                            │
+ * │        └────────────┼─────────────┘                                    │
+ * │                     │ ring_buffer__poll() (epoll 통합)                  │
+ * │                     ▼                                                   │
+ * │             handle_*_event()                                            │
+ * │                     │                                                   │
+ * │          ┌──────────┼──────────┐                                       │
+ * │          ▼          ▼          ▼                                        │
+ * │      match_rules()  to_json()  print_event()                           │
+ * │          │          │                                                   │
+ * │          └──────────┘                                                   │
+ * │                     │                                                   │
+ * │          ┌──────────┼──────────┐                                       │
+ * │          ▼          ▼          ▼                                        │
+ * │        stdout    logfile    HttpReporter                                │
+ * │       (table)   (NDJSON)  (HTTP POST)                                  │
+ * └──────────────────────────────────────────────────────────────────────────┘
+ *
+ * 실행 옵션:
+ *   sudo ./edr-agent [--endpoint URL] [--token TOKEN]
+ *                    [--log FILE] [--alerts-only]
+ */
+
+#include <arpa/inet.h>
+#include <cerrno>
+#include <csignal>
+#include <cstdio>
+#include <cstring>
+#include <string>
+#include <vector>
+#include <getopt.h>
+
+#include <bpf/libbpf.h>
+
+#include "process_monitor.skel.h"
+#include "file_monitor.skel.h"
+#include "network_monitor.skel.h"
+#include "common.h"
+#include "rules/rule_engine.h"
+#include "output/json_fmt.h"
+#include "output/http_reporter.h"
+
+/* ── 전역 상태 ─────────────────────────────────────────────────────────── */
+
+static volatile bool g_running = true;
+static FILE         *g_logfile  = nullptr;
+static HttpReporter *g_reporter = nullptr;
+
+static void sig_handler(int) { g_running = false; }
+
+static int libbpf_print_cb(enum libbpf_print_level level,
+                            const char *fmt, va_list args)
+{
+    if (level == LIBBPF_DEBUG) return 0;
+    return vfprintf(stderr, fmt, args);
+}
+
+/* ── 출력 헬퍼 ─────────────────────────────────────────────────────────── */
+
+#define RESET  "\033[0m"
+#define BOLD   "\033[1m"
+
+/* alert 배열을 터미널에 출력 */
+static void print_alerts(const std::vector<RuleMatch> &hits)
+{
+    for (const auto &h : hits) {
+        printf("  %s%s[ALERT] %s | %s%s\n",
+               BOLD, severity_color(h.severity),
+               h.id, h.name, RESET);
+    }
+}
+
+/* 공통 후처리: JSON 직렬화 → 로그 파일 → HTTP 리포터 */
+static void emit(const std::string &json, bool has_alert)
+{
+    if (g_logfile) {
+        fprintf(g_logfile, "%s\n", json.c_str());
+        fflush(g_logfile);
+    }
+    if (g_reporter)
+        g_reporter->submit(json, has_alert);
+}
+
+/* ── 이벤트 핸들러 ─────────────────────────────────────────────────────── */
+
+static int handle_proc_event(void *, void *data, size_t sz)
+{
+    if (sz < sizeof(process_event)) return 0;
+    const auto &e = *static_cast<const process_event *>(data);
+
+    auto hits = match_rules(e);
+    bool alert = !hits.empty();
+
+    printf("[EXEC ] %9.3fs  PID=%-6u PPID=%-6u UID=%-5u  %-16s  %s\n",
+           (double)e.ts_ns / 1e9, e.pid, e.ppid, e.uid, e.comm, e.filename);
+
+    print_alerts(hits);
+    emit(to_json(e, hits), alert);
+    return 0;
+}
+
+static std::string decode_flags(__u32 f)
+{
+    std::string s;
+    auto a = [&](const char *n){ if (!s.empty()) s += '|'; s += n; };
+    if (f & 0x001) a("WRITE");
+    if (f & 0x002) a("RDWR");
+    if (f & 0x040) a("CREAT");
+    if (f & 0x200) a("TRUNC");
+    if (f & 0x400) a("APPEND");
+    return s.empty() ? "0" : s;
+}
+
+static int handle_file_event(void *, void *data, size_t sz)
+{
+    if (sz < sizeof(file_event)) return 0;
+    const auto &e = *static_cast<const file_event *>(data);
+
+    auto hits = match_rules(e);
+    bool alert = !hits.empty();
+    double ts = (double)e.ts_ns / 1e9;
+
+    switch (e.type) {
+    case EVENT_FILE_WRITE:
+        printf("[WRITE] %9.3fs  PID=%-6u UID=%-5u  %-16s  [%s] %s\n",
+               ts, e.pid, e.uid, e.comm, decode_flags(e.flags).c_str(), e.path);
+        break;
+    case EVENT_FILE_DELETE:
+        printf("[DELET] %9.3fs  PID=%-6u UID=%-5u  %-16s  %s\n",
+               ts, e.pid, e.uid, e.comm, e.path);
+        break;
+    case EVENT_FILE_RENAME:
+        printf("[RENAM] %9.3fs  PID=%-6u UID=%-5u  %-16s  %s  →  %s\n",
+               ts, e.pid, e.uid, e.comm, e.path, e.path2);
+        break;
+    }
+
+    print_alerts(hits);
+    emit(to_json(e, hits), alert);
+    return 0;
+}
+
+static int handle_net_event(void *, void *data, size_t sz)
+{
+    if (sz < sizeof(net_event)) return 0;
+    const auto &e = *static_cast<const net_event *>(data);
+
+    auto hits = match_rules(e);
+    bool alert = !hits.empty();
+    double ts  = (double)e.ts_ns / 1e9;
+
+    char ip[INET6_ADDRSTRLEN] = {};
+    inet_ntop((e.family == 10) ? AF_INET6 : AF_INET, e.daddr, ip, sizeof(ip));
+    uint16_t port = ntohs(e.dport);
+
+    if (e.type == EVENT_NET_CONNECT)
+        printf("[CONN ] %9.3fs  PID=%-6u UID=%-5u  %-16s  → %s:%u\n",
+               ts, e.pid, e.uid, e.comm, ip, port);
+    else
+        printf("[BIND ] %9.3fs  PID=%-6u UID=%-5u  %-16s  *:%u\n",
+               ts, e.pid, e.uid, e.comm, port);
+
+    print_alerts(hits);
+    emit(to_json(e, hits), alert);
+    return 0;
+}
+
+/* ── BPF 로드 헬퍼 (중복 제거) ─────────────────────────────────────────── */
+
+template<typename Skel>
+static int load_and_attach(Skel **out, const char *name,
+                            Skel *(*open_fn)(),
+                            int   (*load_fn)(Skel *),
+                            int   (*attach_fn)(Skel *))
+{
+    *out = open_fn();
+    if (!*out) { fprintf(stderr, "[!] %s open 실패\n", name); return -1; }
+
+    int err = load_fn(*out);
+    if (err) { fprintf(stderr, "[!] %s load 실패: %s\n", name, strerror(-err)); return err; }
+
+    err = attach_fn(*out);
+    if (err) { fprintf(stderr, "[!] %s attach 실패: %s\n", name, strerror(-err)); return err; }
+
+    return 0;
+}
+
+/* ── main ────────────────────────────────────────────────────────────────── */
+
+static void print_usage(const char *prog)
+{
+    fprintf(stderr,
+        "사용법: sudo %s [옵션]\n"
+        "  --endpoint URL     HTTP 전송 엔드포인트  (예: http://localhost:8888)\n"
+        "  --token    TOKEN   Bearer 인증 토큰\n"
+        "  --log      FILE    NDJSON 이벤트 로그 파일 경로\n"
+        "  --alerts-only      HTTP 전송: alert 있는 이벤트만 전송\n"
+        "  --help             이 도움말\n", prog);
+}
+
+int main(int argc, char **argv)
+{
+    /* ── 인자 파싱 ────────────────────────────────────────────────────── */
+    std::string endpoint, token, logpath;
+    bool alerts_only = false;
+
+    static const option longopts[] = {
+        {"endpoint",    required_argument, nullptr, 'e'},
+        {"token",       required_argument, nullptr, 't'},
+        {"log",         required_argument, nullptr, 'l'},
+        {"alerts-only", no_argument,       nullptr, 'a'},
+        {"help",        no_argument,       nullptr, 'h'},
+        {nullptr, 0, nullptr, 0}
+    };
+
+    int opt;
+    while ((opt = getopt_long(argc, argv, "e:t:l:ah", longopts, nullptr)) != -1) {
+        switch (opt) {
+        case 'e': endpoint    = optarg; break;
+        case 't': token       = optarg; break;
+        case 'l': logpath     = optarg; break;
+        case 'a': alerts_only = true;   break;
+        case 'h': print_usage(argv[0]); return 0;
+        default:  print_usage(argv[0]); return 1;
+        }
+    }
+
+    /* ── 출력 대상 초기화 ─────────────────────────────────────────────── */
+    if (!logpath.empty()) {
+        g_logfile = fopen(logpath.c_str(), "a");
+        if (!g_logfile)
+            fprintf(stderr, "[!] 로그 파일 열기 실패: %s\n", strerror(errno));
+        else
+            fprintf(stderr, "[*] 이벤트 로그: %s\n", logpath.c_str());
+    }
+
+    HttpReporter reporter(endpoint, token, alerts_only);
+    if (reporter.active()) g_reporter = &reporter;
+
+    /* ── 시그널 & libbpf ──────────────────────────────────────────────── */
+    signal(SIGINT,  sig_handler);
+    signal(SIGTERM, sig_handler);
+    libbpf_set_print(libbpf_print_cb);
+
+    /* ── BPF 스켈레톤 로드 ────────────────────────────────────────────── */
+    process_monitor_bpf *proc_skel = nullptr;
+    file_monitor_bpf    *file_skel = nullptr;
+    network_monitor_bpf *net_skel  = nullptr;
+    ring_buffer         *rb        = nullptr;
+    int err = 0;
+
+    if ((err = load_and_attach(&proc_skel, "process_monitor",
+            process_monitor_bpf__open,
+            process_monitor_bpf__load,
+            process_monitor_bpf__attach)) < 0) goto cleanup;
+
+    if ((err = load_and_attach(&file_skel, "file_monitor",
+            file_monitor_bpf__open,
+            file_monitor_bpf__load,
+            file_monitor_bpf__attach)) < 0) goto cleanup;
+
+    if ((err = load_and_attach(&net_skel, "network_monitor",
+            network_monitor_bpf__open,
+            network_monitor_bpf__load,
+            network_monitor_bpf__attach)) < 0) goto cleanup;
+
+    /* ── 통합 링버퍼 폴러 ─────────────────────────────────────────────── */
+    rb = ring_buffer__new(bpf_map__fd(proc_skel->maps.rb),
+                          handle_proc_event, nullptr, nullptr);
+    if (!rb) { err = -1; goto cleanup; }
+
+    if ((err = ring_buffer__add(rb, bpf_map__fd(file_skel->maps.rb),
+                                handle_file_event, nullptr)) < 0) goto cleanup;
+    if ((err = ring_buffer__add(rb, bpf_map__fd(net_skel->maps.rb),
+                                handle_net_event,  nullptr)) < 0) goto cleanup;
+
+    /* ── 헤더 출력 ────────────────────────────────────────────────────── */
+    printf(BOLD
+        "+----------------------------------------------------------------------+\n"
+        "|   EDR Agent  ·  Process + File + Network  (eBPF)                    |\n"
+        "|   Ctrl+C 로 종료                                                    |\n"
+        "+----------------------------------------------------------------------+\n"
+        RESET);
+    printf("%-8s %-10s %-8s %-6s  %-16s  %s\n",
+           "TYPE", "TIME(s)", "PID", "UID", "COMM", "PATH / DEST");
+    printf("%s\n", std::string(72, '-').c_str());
+
+    /* ── 이벤트 폴 루프 ───────────────────────────────────────────────── */
+    while (g_running) {
+        err = ring_buffer__poll(rb, 100);
+        if (err == -EINTR) { err = 0; break; }
+        if (err < 0)       { fprintf(stderr, "[!] poll 에러: %d\n", err); break; }
+    }
+
+    printf("\n[*] 종료 중...\n");
+    if (g_reporter) g_reporter->flush();
+
+cleanup:
+    ring_buffer__free(rb);
+    network_monitor_bpf__destroy(net_skel);
+    file_monitor_bpf__destroy(file_skel);
+    process_monitor_bpf__destroy(proc_skel);
+    if (g_logfile) fclose(g_logfile);
+    return (err < 0) ? 1 : 0;
+}
