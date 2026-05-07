@@ -254,9 +254,18 @@ static int handle_net_event(void *, void *data, size_t sz)
     inet_ntop((e.family == 10) ? AF_INET6 : AF_INET, e.daddr, ip, sizeof(ip));
     uint16_t port = ntohs(e.dport);
 
+    /*
+     * IPv4-mapped IPv6 주소 정규화: "::ffff:1.2.3.4" → "1.2.3.4"
+     * connect(AF_INET6) 소켓이 IPv4 주소에 연결할 때 커널이 자동 변환한다.
+     * 접두사를 제거하면 규칙 매칭과 출력이 IPv4와 일관된다.
+     */
+    const char *ip_display = ip;
+    if (strncmp(ip, "::ffff:", 7) == 0)
+        ip_display = ip + 7;
+
     if (e.type == EVENT_NET_CONNECT)
         printf("[CONN ] %9.3fs  PID=%-6u %-12s  %-16s  → %s:%u\n",
-               ts, e.pid, uid_name(e.uid), e.comm, ip, port);
+               ts, e.pid, uid_name(e.uid), e.comm, ip_display, port);
     else
         printf("[BIND ] %9.3fs  PID=%-6u %-12s  %-16s  *:%u\n",
                ts, e.pid, uid_name(e.uid), e.comm, port);
