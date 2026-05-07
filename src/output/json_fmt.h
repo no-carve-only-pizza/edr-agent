@@ -21,3 +21,4 @@ std::string json_esc(const char *s);
 std::string to_json(const process_event &e, const std::vector<RuleMatch> &hits);
 std::string to_json(const file_event    &e, const std::vector<RuleMatch> &hits);
 std::string to_json(const net_event     &e, const std::vector<RuleMatch> &hits);
+std::string to_json(const ptrace_event  &e, const std::vector<RuleMatch> &hits);

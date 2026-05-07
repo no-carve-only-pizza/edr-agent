@@ -235,6 +235,30 @@ static const char *OUTBOUND_WHITELIST[] = {
  *   pip install xxx              → setup.py 실행 (python3 호출)
  *   make install                 → Makefile 내부에서 python3 호출
  */
+/*
+ * R-015 화이트리스트: 알려진 setuid 바이너리.
+ * 이 목록 외의 프로세스가 uid≠euid 로 실행되면 의심.
+ */
+static const char *SETUID_WHITELIST[] = {
+    "sudo", "su", "newgrp", "passwd", "chsh", "chfn", "chage", "gpasswd",
+    "ping", "ping6", "traceroute6",
+    "pkexec",
+    "crontab", "at",
+    "mount", "umount", "fusermount", "fusermount3",
+    "ssh", "ssh-agent",
+    nullptr
+};
+
+/*
+ * R-014 화이트리스트: 합법적인 디버거/프로파일러.
+ * 이 목록의 프로세스가 PTRACE_ATTACH 해도 발화하지 않는다.
+ */
+static const char *PTRACE_WHITELIST[] = {
+    "gdb", "lldb", "strace", "ltrace",
+    "perf", "valgrind", "rr",
+    nullptr
+};
+
 static const char *PKG_MANAGER_COMMS[] = {
     "apt", "apt-get", "dpkg", "dpkg-preconfig",
     "pip", "pip3",
@@ -266,6 +290,34 @@ std::vector<RuleMatch> match_rules(const process_event &e)
     /* R-008: root 권한으로 인터프리터 실행 (권한 상승 후 페이로드 실행 의심) */
     if (e.uid == 0 && comm_in(e.comm, INTERPRETERS))
         hits.push_back({"R-008", "root 권한 인터프리터 실행", "critical"});
+
+    /*
+     * R-013: LD_PRELOAD 환경변수 인젝션.
+     *
+     * LD_PRELOAD 는 동적 링커가 다른 공유 라이브러리보다 먼저 지정된 .so 를 로드한다.
+     * 공격자는 이를 이용해 libc 함수(open, read, readdir 등)를 후킹하거나
+     * 정상 바이너리 실행 시 악성 코드를 함께 실행한다.
+     *
+     * 예:
+     *   LD_PRELOAD=/tmp/evil.so /bin/ls   → ls 실행 전 evil.so 로드
+     *   LD_PRELOAD=/dev/shm/hook.so bash  → bash의 libc 함수 후킹
+     */
+    if (e.has_ld_preload)
+        hits.push_back({"R-013", "LD_PRELOAD 환경변수 인젝션 의심", "high"});
+
+    /*
+     * R-015: setuid 바이너리 실행 (권한 상승).
+     *
+     * uid(real) ≠ euid(effective) 이면 setuid 비트가 설정된 바이너리다.
+     * 알려진 정상 setuid 바이너리(sudo, ping 등)는 화이트리스트로 제외.
+     * 예상치 못한 경로(/tmp, /home 등)의 setuid 실행이 특히 위험.
+     *
+     * TOCTOU 공격 시나리오:
+     *   1) /tmp/evil 에 setuid root 바이너리 쓰기 (R-001 트리거)
+     *   2) /tmp/evil 실행 → R-003 + R-015 동시 트리거 → 높은 신뢰도
+     */
+    if (e.uid != e.euid && !comm_in(e.comm, SETUID_WHITELIST))
+        hits.push_back({"R-015", "예상치 못한 setuid 실행 (권한 상승 의심)", "critical"});
 
     /*
      * R-010: 인터프리터 + -c 플래그 (인라인 페이로드 실행).
@@ -437,6 +489,29 @@ std::vector<RuleMatch> match_rules(const process_event &e, const char *parent_co
      */
     if (comm_in(parent_comm, DB_SERVERS) && (child_is_shell || child_is_interp))
         hits.push_back({"R-012", "DB 서버 자식 셸 실행 (SQLi RCE 의심)", "critical"});
+
+    return hits;
+}
+
+std::vector<RuleMatch> match_rules(const ptrace_event &e)
+{
+    std::vector<RuleMatch> hits;
+
+    /*
+     * R-014: ptrace ATTACH - 프로세스 추적/인젝션 시도.
+     *
+     * PTRACE_ATTACH: 실행 중인 프로세스를 일시 정지하고 메모리/레지스터 접근.
+     * PTRACE_SEIZE:  SIGSTOP 없이 attach (더 은밀한 방식, 리눅스 3.4+).
+     *
+     * 공격 시나리오:
+     *   - 자격증명 탈취: sshd/sudo 메모리에서 비밀번호 읽기
+     *   - 코드 인젝션: PTRACE_POKEDATA 로 쉘코드 삽입
+     *   - 프로세스 하이재킹: 실행 흐름 변경
+     *
+     * 합법적 사용(gdb, strace 등)은 PTRACE_WHITELIST 로 억제.
+     */
+    if (!comm_in(e.comm, PTRACE_WHITELIST))
+        hits.push_back({"R-014", "ptrace ATTACH - 프로세스 추적/인젝션 의심", "high"});
 
     return hits;
 }
