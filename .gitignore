@@ -5,3 +5,6 @@ vmlinux.h
 compile_commands.json
 .cache/
 *.ndjson
+*.log
+test_mmap
+test_mmap.c
