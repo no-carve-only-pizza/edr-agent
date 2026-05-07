@@ -61,6 +61,12 @@ struct {
     __uint(max_entries, 1 << 18); /* 256 KiB */
 } rb_exit SEC(".maps");
 
+/* ptrace 이벤트 전용 링버퍼. */
+struct {
+    __uint(type, BPF_MAP_TYPE_RINGBUF);
+    __uint(max_entries, 1 << 18); /* 256 KiB */
+} rb_ptrace SEC(".maps");
+
 /*
  * argv_store: sys_enter_execve → sched_process_exec 데이터 전달 채널.
  *
@@ -82,6 +88,8 @@ struct {
 struct argv_cache_t {
     char  buf[MAX_ARGV_LEN]; /* NUL 구분 argv 연결: /proc/PID/cmdline 형식 */
     __u32 argc;              /* 실제 저장된 인자 수                         */
+    __u8  has_ld_preload;    /* 1 if envp 에 LD_PRELOAD= 포함               */
+    __u8  _pad[3];
 };
 
 struct {
@@ -156,6 +164,16 @@ int handle_exec(struct trace_event_raw_sched_process_exec *ctx)
     task    = (struct task_struct *)bpf_get_current_task();
     e->ppid = BPF_CORE_READ(task, real_parent, tgid);
 
+    /*
+     * euid: R-015 setuid 바이너리 실행 탐지용.
+     * exec() 성공 후 cred->euid 가 이미 새 바이너리의 소유자 UID로 변경된다.
+     * uid(real) ≠ euid(effective) → setuid 실행.
+     */
+    {
+        const struct cred *cred = BPF_CORE_READ(task, cred);
+        e->euid = BPF_CORE_READ(cred, euid.val);
+    }
+
     /* ── 3. UID 획득 ─────────────────────────────────────────────────────
      *
      * bpf_get_current_uid_gid() 반환값 (u64):
@@ -220,10 +238,12 @@ int handle_exec(struct trace_event_raw_sched_process_exec *ctx)
         struct argv_cache_t *av = bpf_map_lookup_elem(&argv_store, &pid_key);
         if (av) {
             __builtin_memcpy(e->argv, av->buf, MAX_ARGV_LEN);
-            e->argc = av->argc;
+            e->argc           = av->argc;
+            e->has_ld_preload = av->has_ld_preload;
             bpf_map_delete_elem(&argv_store, &pid_key);
         } else {
-            e->argc = 0;
+            e->argc           = 0;
+            e->has_ld_preload = 0;
         }
     }
 
@@ -320,6 +340,38 @@ int handle_sys_execve(struct trace_event_raw_sys_enter *ctx)
         off += (__u32)r; /* r에는 NUL 바이트 포함 → 다음 인자 시작 위치 */
     }
 
+    /*
+     * envp 스캔: LD_PRELOAD= 탐지 (R-013).
+     *
+     * LD_PRELOAD 는 공유 라이브러리 인젝션의 전형적 기법이다.
+     *   - 공격자: LD_PRELOAD=/tmp/evil.so ls  → evil.so 의 심볼이 우선 로드
+     *   - 루트킷: LD_PRELOAD 로 libc 함수 후킹(readdir, open 등 은폐)
+     *
+     * 처음 16개 환경변수만 검사한다:
+     *   LD_PRELOAD 는 보통 첫 몇 개 env 에 위치한다.
+     *   16회 #pragma unroll → BPF 검증기 복잡도 제한 내.
+     *
+     * envbuf[12]: "LD_PRELOAD=" = 11자 + NUL. 값 내용은 불필요.
+     */
+    {
+        const char **envp_user = (const char **)ctx->args[2];
+        char envbuf[12] = {};
+        #pragma unroll
+        for (int i = 0; i < 16; i++) {
+            const char *env = NULL;
+            if (bpf_probe_read_user(&env, sizeof(env), &envp_user[i]) < 0 || !env)
+                break;
+            bpf_probe_read_user_str(envbuf, sizeof(envbuf), env);
+            /* "LD_PRELOAD=" 11자 직접 비교 (strncmp 불가 - BPF 스택 경계 문제) */
+            if (envbuf[0]=='L' && envbuf[1]=='D' && envbuf[2]=='_' &&
+                envbuf[3]=='P' && envbuf[4]=='R' && envbuf[5]=='E' &&
+                envbuf[6]=='L' && envbuf[7]=='O' && envbuf[8]=='A' &&
+                envbuf[9]=='D' && envbuf[10]=='=') {
+                entry.has_ld_preload = 1;
+            }
+        }
+    }
+
     /* PID 를 키로 argv_store 에 저장. sched_process_exec 에서 소비. */
     bpf_map_update_elem(&argv_store, &pid, &entry, BPF_ANY);
     return 0;
@@ -330,6 +382,50 @@ int handle_sys_execve(struct trace_event_raw_sys_enter *ctx)
  * bpf_probe_read_kernel() 등 "GPL only" helper를 사용할 수 있다.
  * 커널이 bpf(BPF_PROG_LOAD) 시 이 필드를 검사한다.
  */
+/*
+ * sys_enter_ptrace: ptrace() ATTACH 감지 (R-014).
+ *
+ * ptrace 는 리눅스 프로세스 디버깅/추적 인터페이스로, 다음 공격에 악용된다:
+ *   - 프로세스 인젝션: PTRACE_ATTACH → PTRACE_POKEDATA 로 실행 중인 프로세스
+ *     메모리에 쉘코드 삽입 후 실행 (고전적 userland rootkit 기법)
+ *   - 자격증명 탈취: PTRACE_ATTACH → ssh/sshd 메모리에서 비밀번호 읽기
+ *   - 안티-포렌식: ptrace 로 다른 프로세스의 행위를 조작
+ *
+ * sys_enter_ptrace 인자:
+ *   args[0] = request  (PTRACE_ATTACH=16, PTRACE_SEIZE=0x4206, ...)
+ *   args[1] = pid      (대상 프로세스 PID)
+ *   args[2] = addr
+ *   args[3] = data
+ *
+ * PTRACE_ATTACH 와 PTRACE_SEIZE 만 캡처한다.
+ * PTRACE_POKEDATA 등 은 ATTACH 없이는 실패하므로 ATTACH 탐지로 충분하다.
+ */
+#define PTRACE_ATTACH 16
+#define PTRACE_SEIZE  0x4206
+
+SEC("tp/syscalls/sys_enter_ptrace")
+int handle_ptrace(struct trace_event_raw_sys_enter *ctx)
+{
+    __u32 request = (__u32)ctx->args[0];
+
+    if (request != PTRACE_ATTACH && request != PTRACE_SEIZE)
+        return 0;
+
+    struct ptrace_event *e = bpf_ringbuf_reserve(&rb_ptrace, sizeof(*e), 0);
+    if (!e) return 0;
+
+    __u64 pid_tgid = bpf_get_current_pid_tgid();
+    e->pid        = (__u32)(pid_tgid >> 32);
+    e->target_pid = (__u32)ctx->args[1];
+    e->uid        = (__u32)bpf_get_current_uid_gid();
+    e->request    = request;
+    e->ts_ns      = bpf_ktime_get_ns();
+    bpf_get_current_comm(&e->comm, sizeof(e->comm));
+
+    bpf_ringbuf_submit(e, 0);
+    return 0;
+}
+
 /*
  * sched_process_exit: 프로세스 종료 시 ProcTree 정리를 위한 훅.
  *

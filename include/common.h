@@ -57,6 +57,7 @@
 #define EVENT_NET_CONNECT 5u  /* sys_enter_connect: 아웃바운드 연결 시도     */
 #define EVENT_NET_BIND    6u  /* sys_enter_bind: 포트 바인드(서버 오픈)      */
 #define EVENT_PROC_EXIT   7u  /* sched_process_exit: 프로세스 정상 종료      */
+#define EVENT_PROC_PTRACE 8u  /* sys_enter_ptrace: ptrace ATTACH 감지        */
 
 /* ── 구조체 정의 ─────────────────────────────────────────────────────── */
 
@@ -73,12 +74,15 @@
 struct process_event {
     __u32 pid;                        /* 유저스페이스 PID = 커널 TGID        */
     __u32 ppid;                       /* 부모 프로세스 ID (real_parent.tgid) */
-    __u32 uid;                        /* 실효 UID                            */
+    __u32 uid;                        /* 실UID (real uid)                    */
     __u32 argc;                       /* 캡처된 argv 인자 수 (0 = 미캡처)   */
     __u64 ts_ns;                      /* bpf_ktime_get_ns(): 부팅 이후 ns    */
     char  comm[TASK_COMM_LEN];        /* task_struct.comm (basename)         */
     char  filename[MAX_FILENAME_LEN]; /* execve() 에 전달된 실행 파일 경로   */
     char  argv[MAX_ARGV_LEN];         /* argv 연결 버퍼: NUL 구분, cmdline 형식 */
+    __u32 euid;                       /* 실효 UID (R-015: uid≠euid → setuid 실행) */
+    __u8  has_ld_preload;             /* 1 if envp 에 LD_PRELOAD= 포함 (R-013) */
+    __u8  _pad2[3];                   /* 구조체 정렬 패딩 */
 };
 
 /*
@@ -137,6 +141,21 @@ struct net_event {
     __u64 ts_ns;               /* bpf_ktime_get_ns()                     */
     char  comm[TASK_COMM_LEN]; /* task_struct.comm                       */
     __u8  daddr[16];           /* 대상/로컬 IP 주소                      */
+};
+
+/*
+ * ptrace_event: ptrace() ATTACH 이벤트.
+ *
+ * sys_enter_ptrace 트레이스포인트에서 PTRACE_ATTACH/PTRACE_SEIZE 요청만 캡처.
+ * 프로세스 인젝션(PTRACE_POKEDATA) 이나 디버거 탐지에 사용된다.
+ */
+struct ptrace_event {
+    __u32 pid;              /* 추적자(tracer) PID          */
+    __u32 target_pid;       /* 추적 대상(tracee) PID       */
+    __u32 uid;
+    __u32 request;          /* PTRACE_ATTACH=16 등         */
+    __u64 ts_ns;
+    char  comm[TASK_COMM_LEN];
 };
 
 /*

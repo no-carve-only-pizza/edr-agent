@@ -283,6 +283,24 @@ static int handle_exit_event(void *, void *data, size_t sz)
     return 0;
 }
 
+static int handle_ptrace_event(void *, void *data, size_t sz)
+{
+    if (sz < sizeof(ptrace_event)) return 0;
+    const auto &e = *static_cast<const ptrace_event *>(data);
+
+    auto hits = dedup_alerts(match_rules(e), e.comm, e.ts_ns);
+    bool alert = !hits.empty();
+    g_n_proc++;
+    for (const auto &h : hits) g_rule_counts[h.id]++;
+
+    printf("[PTRAC] %9.3fs  PID=%-6u %-12s  %-16s  → target PID=%u\n",
+           (double)e.ts_ns / 1e9, e.pid, uid_name(e.uid), e.comm, e.target_pid);
+
+    print_alerts(hits);
+    emit(to_json(e, hits), alert);
+    return 0;
+}
+
 /* ── BPF 로드 헬퍼 (중복 제거) ─────────────────────────────────────────── */
 
 template<typename Skel>
@@ -392,7 +410,9 @@ int main(int argc, char **argv)
     if ((err = ring_buffer__add(rb, bpf_map__fd(net_skel->maps.rb),
                                 handle_net_event,   nullptr)) < 0) goto cleanup;
     if ((err = ring_buffer__add(rb, bpf_map__fd(proc_skel->maps.rb_exit),
-                                handle_exit_event,  nullptr)) < 0) goto cleanup;
+                                handle_exit_event,   nullptr)) < 0) goto cleanup;
+    if ((err = ring_buffer__add(rb, bpf_map__fd(proc_skel->maps.rb_ptrace),
+                                handle_ptrace_event, nullptr)) < 0) goto cleanup;
 
     /* ── 프로세스 트리 초기화 ────────────────────────────────────────────
      *

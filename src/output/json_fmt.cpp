@@ -115,6 +115,12 @@ std::string to_json(const process_event &e, const std::vector<RuleMatch> &hits)
     j += ",\"comm\":";     j += json_esc(e.comm);
     j += ",\"path\":";     j += json_esc(e.filename);
     j += ",\"argv\":";     j += argv_json(e.argv, e.argc);
+
+    snprintf(buf, sizeof(buf), "%u", e.euid);
+    j += ",\"euid\":"; j += buf;
+
+    j += ",\"ld_preload\":"; j += e.has_ld_preload ? "true" : "false";
+
     j += ",\"alerts\":";   j += alerts_json(hits);
     j += "}";
     return j;
@@ -184,6 +190,35 @@ std::string to_json(const net_event &e, const std::vector<RuleMatch> &hits)
     j += ",\"dport\":"; j += buf;
 
     j += ",\"family\":"; j += (e.family == 10) ? "\"ipv6\"" : "\"ipv4\"";
+
+    j += ",\"alerts\":"; j += alerts_json(hits);
+    j += "}";
+    return j;
+}
+
+std::string to_json(const ptrace_event &e, const std::vector<RuleMatch> &hits)
+{
+    char buf[64];
+    std::string j = "{";
+
+    j += "\"type\":\"ptrace\"";
+
+    snprintf(buf, sizeof(buf), "%.3f", (double)e.ts_ns / 1e9);
+    j += ",\"ts\":"; j += buf;
+
+    snprintf(buf, sizeof(buf), "%u", e.pid);
+    j += ",\"pid\":"; j += buf;
+
+    snprintf(buf, sizeof(buf), "%u", e.uid);
+    j += ",\"uid\":"; j += buf;
+
+    j += ",\"comm\":"; j += json_esc(e.comm);
+
+    snprintf(buf, sizeof(buf), "%u", e.target_pid);
+    j += ",\"target_pid\":"; j += buf;
+
+    snprintf(buf, sizeof(buf), "%u", e.request);
+    j += ",\"request\":"; j += buf;
 
     j += ",\"alerts\":"; j += alerts_json(hits);
     j += "}";
