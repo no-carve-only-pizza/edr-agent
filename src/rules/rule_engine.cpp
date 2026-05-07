@@ -24,6 +24,7 @@
  *   - 화이트리스트: known-good 프로세스/경로 목록으로 FP 억제
  */
 #include "rules/rule_engine.h"
+#include <algorithm>    /* std::remove_if */
 #include <arpa/inet.h>  /* ntohs() */
 #include <cstring>
 
@@ -137,11 +138,111 @@ static const char *INTERPRETERS[] = {
  * 마지막 0 은 sentinel (배열 끝 표시).
  */
 static const uint16_t COMMON_PORTS[] = {
+    /* 표준 프로토콜 */
     21, 22, 25, 53, 80, 110, 143,
     443, 465, 587, 993, 995,
-    3306, 5432, 6379, 27017,
-    8080, 8443, 9200,
+    /* 데이터베이스 */
+    1433,              /* MSSQL          */
+    3306, 5432,        /* MySQL, Postgres */
+    6379, 27017,       /* Redis, MongoDB  */
+    /* 웹/API */
+    8080, 8443, 8888, 9200,
+    /* 개발 서버 (React/Vue/Flask/FastAPI 등) */
+    3000, 4200, 5000, 5173, 8000,
+    /* 모니터링·오케스트레이션 */
+    9090, 9100,        /* Prometheus, node_exporter */
+    6443, 10250,       /* Kubernetes API, kubelet   */
+    2375, 2376,        /* Docker daemon             */
     0  /* sentinel */
+};
+
+/* ── 화이트리스트 ────────────────────────────────────────────────────────── */
+
+/*
+ * R-007 화이트리스트: 합법적으로 포트를 바인드하는 알려진 시스템/서버 프로세스.
+ *
+ * 이 목록에 있는 프로세스의 bind() 는 R-007 에서 제외한다.
+ * 웹 서버(nginx 등)와 DB(mysqld 등)는 R-011/R-012 에서 더 정교하게 탐지하므로
+ * R-007(low) 중복 발화를 막는다.
+ *
+ * comm 은 task_struct.comm 으로 최대 15자이므로 긴 이름은 잘린다:
+ *   NetworkManager  → "NetworkManage"   (15자)
+ *   systemd-resolve → "systemd-resolve" (15자)
+ *   containerd-shim → "containerd-shi"  (15자)
+ */
+static const char *BIND_WHITELIST[] = {
+    /* 시스템 데몬 */
+    "systemd", "systemd-resolve", "dbus-daemon",
+    "NetworkManage",   /* NetworkManager */
+    "avahi-daemon", "cupsd", "cups-browsed",
+    "rsyslogd", "journald", "snapd",
+    /* 원격 접속 */
+    "sshd",
+    /* 컨테이너/가상화 */
+    "dockerd", "containerd", "containerd-shi",
+    "libvirtd", "virtlogd",
+    /* 웹 서버 (R-011 으로 충분히 커버) */
+    "nginx", "apache", "apache2", "httpd", "lighttpd",
+    "gunicorn", "uwsgi", "php-fpm",
+    /* DB 서버 (R-012 으로 충분히 커버) */
+    "mysqld", "mysqld_safe", "mariadbd",
+    "postgres", "postmaster",
+    "mongod", "redis-server", "memcached",
+    nullptr
+};
+
+/*
+ * R-001 화이트리스트: 패키지 관리자·인스톨러가 시스템 경로에 쓰는 것은 정상.
+ *
+ * apt/dpkg 가 /usr/bin, /lib 등에 파일을 설치하거나
+ * update-alternatives 가 심볼릭 링크를 갱신하는 동작을 FP 로 처리한다.
+ *
+ * comm 15자 한도:
+ *   update-alternatives → "update-alterna"
+ *   dpkg-preconfigure  → "dpkg-preconfig"
+ */
+static const char *SYS_WRITE_WHITELIST[] = {
+    "dpkg", "dpkg-unpack", "dpkg-preconfig",
+    "apt", "apt-get",
+    "update-alterna",  /* update-alternatives */
+    "rpm", "yum", "dnf", "zypper",
+    "snap", "snapd",
+    nullptr
+};
+
+/*
+ * R-006 화이트리스트: 비표준 포트를 사용하는 것이 정상인 시스템 도구.
+ *
+ * curl/wget: 사용자가 명시적으로 지정한 포트로 요청 (테스트, API 호출)
+ * apt/apt-get: 비표준 포트의 사설 미러 접속
+ * git: HTTP/HTTPS 이외의 포트 사용 (기업 내부 Gitea 등)
+ * snap: Snap Store 내부 API
+ */
+static const char *OUTBOUND_WHITELIST[] = {
+    "apt", "apt-get", "apt-transport",
+    "curl", "wget",
+    "git", "git-remote-http",
+    "snap", "snapd",
+    nullptr
+};
+
+/*
+ * R-005/R-008 부모 화이트리스트: 패키지 관리자·빌드 도구가 인터프리터를
+ * 실행하는 경우는 정상적인 설치/빌드 동작이다.
+ *
+ * 예:
+ *   apt-get install python3-foo  → python3 포스트인스톨 스크립트 실행
+ *   pip install xxx              → setup.py 실행 (python3 호출)
+ *   make install                 → Makefile 내부에서 python3 호출
+ */
+static const char *PKG_MANAGER_COMMS[] = {
+    "apt", "apt-get", "dpkg", "dpkg-preconfig",
+    "pip", "pip3",
+    "npm", "yarn", "pnpm",
+    "cargo", "rustc",
+    "make", "cmake", "ninja",
+    "gradle", "mvn",
+    nullptr
 };
 
 /* ── 이벤트별 룰 매칭 구현 ──────────────────────────────────────────────── */
@@ -192,8 +293,12 @@ std::vector<RuleMatch> match_rules(const file_event &e)
     std::vector<RuleMatch> hits;
 
     if (e.type == EVENT_FILE_WRITE || e.type == EVENT_FILE_RENAME) {
-        /* R-001: 시스템 바이너리/설정 파일 수정 */
-        if (path_has_prefix(e.path, SENSITIVE_PATHS))
+        /*
+         * R-001: 시스템 바이너리/설정 파일 수정.
+         * SYS_WRITE_WHITELIST: apt/dpkg 등 패키지 관리자의 합법적 설치 동작 제외.
+         */
+        if (path_has_prefix(e.path, SENSITIVE_PATHS) &&
+            !comm_in(e.comm, SYS_WRITE_WHITELIST))
             hits.push_back({"R-001", "시스템 경로 파일 수정", "high"});
     }
 
@@ -224,14 +329,24 @@ std::vector<RuleMatch> match_rules(const net_event &e)
     uint16_t port = ntohs(e.dport);
 
     if (e.type == EVENT_NET_CONNECT && port != 0) {
-        /* R-006: 비표준 포트 아웃바운드 연결 */
-        if (!port_in(port, COMMON_PORTS))
+        /*
+         * R-006: 비표준 포트 아웃바운드 연결.
+         * OUTBOUND_WHITELIST: curl/wget/apt 등 도구는 사용자가 의도적으로
+         * 지정한 포트를 사용하므로 제외한다.
+         */
+        if (!port_in(port, COMMON_PORTS) && !comm_in(e.comm, OUTBOUND_WHITELIST))
             hits.push_back({"R-006", "비표준 포트 아웃바운드 연결", "medium"});
     }
 
     if (e.type == EVENT_NET_BIND && port != 0) {
-        /* R-007: 서버 포트 바인드 (백도어 리스너 의심) */
-        hits.push_back({"R-007", "서버 포트 바인드", "low"});
+        /*
+         * R-007: 서버 포트 바인드 (백도어 리스너 의심).
+         * BIND_WHITELIST: 합법적인 서버 프로세스(sshd, nginx, mysqld 등) 제외.
+         * 웹·DB 서버는 R-011/R-012 에서 더 정교하게 탐지되므로
+         * R-007(low) 중복 발화를 막는다.
+         */
+        if (!comm_in(e.comm, BIND_WHITELIST))
+            hits.push_back({"R-007", "서버 포트 바인드 (알 수 없는 프로세스)", "low"});
     }
 
     return hits;
@@ -275,6 +390,26 @@ std::vector<RuleMatch> match_rules(const process_event &e, const char *parent_co
 {
     /* 기존 단독 이벤트 룰 먼저 수집 */
     auto hits = match_rules(e);
+
+    /*
+     * R-005/R-008 FP 억제: 패키지 관리자·빌드 도구가 부모인 경우.
+     *
+     * apt install python3-package → postinst 스크립트에서 python3 호출
+     * pip install xxx             → setup.py 빌드 중 python3 호출
+     * make install                → Makefile 에서 python3 호출
+     *
+     * 이 경우 R-005(medium)/R-008(critical) 이 FP로 발화한다.
+     * std::remove_if 로 해당 룰을 hits 에서 제거한다.
+     */
+    if (parent_comm && comm_in(parent_comm, PKG_MANAGER_COMMS)) {
+        hits.erase(
+            std::remove_if(hits.begin(), hits.end(),
+                [](const RuleMatch &m) {
+                    return strcmp(m.id, "R-005") == 0 ||
+                           strcmp(m.id, "R-008") == 0;
+                }),
+            hits.end());
+    }
 
     if (!parent_comm || parent_comm[0] == '\0')
         return hits;
