@@ -200,6 +200,9 @@ add_executable(edr-agent
     src/output/json_fmt.cpp
     src/output/http_reporter.cpp
     src/correlation/correlator.cpp
+    src/threat_intel/feed_manager.cpp
+    src/threat_intel/hash_checker.cpp
+    src/anomaly/behavior_profiler.cpp
 )
 
 add_dependencies(edr-agent bpf_build)
@@ -216,6 +219,7 @@ target_link_libraries(edr-agent PRIVATE
     CURL::libcurl
     elf
     z
+    pthread
 )
 
 target_compile_options(edr-agent PRIVATE
