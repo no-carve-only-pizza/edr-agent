@@ -62,7 +62,9 @@
 #include "threat_intel/feed_manager.h"
 #include "threat_intel/hash_checker.h"
 #include "anomaly/behavior_profiler.h"
+#include "action/action_server.h"
 #include <ctime>
+#include <sys/prctl.h>
 
 /* ── 전역 상태 ─────────────────────────────────────────────────────────── */
 
@@ -74,6 +76,7 @@ static CorrelationEngine  g_correlator;
 static FeedManager       *g_feeds      = nullptr;
 static HashChecker       *g_hash       = nullptr;
 static BehaviorProfiler   g_profiler;
+static pid_t              g_agent_pid  = 0; /* self-defense: 자신의 PID */
 
 /*
  * 알림 중복 억제 (dedup):
@@ -453,6 +456,15 @@ static int handle_ptrace_event(void *, void *data, size_t sz)
     g_n_proc++;
     for (const auto &h : hits) g_rule_counts[h.id]++;
 
+    /* Self-Defense: 에이전트 자신을 추적하려는 시도 */
+    if (g_agent_pid && e.target_pid == (uint32_t)g_agent_pid) {
+        printf("\033[1;31m[SELF-DEFENSE]\033[0m PID=%-6u %-16s가 EDR 에이전트(PID=%d)를 추적 시도!\n",
+               e.pid, e.comm, g_agent_pid);
+        /* 추적자를 즉시 종료 */
+        kill(e.pid, SIGKILL);
+        fprintf(stderr, "[*] self-defense: PID %u (%s) 종료 (SIGKILL)\n", e.pid, e.comm);
+    }
+
     printf("[PTRAC] %9.3fs  PID=%-6u %-12s  %-16s  → target PID=%u\n",
            (double)e.ts_ns / 1e9, e.pid, uid_name(e.uid), e.comm, e.target_pid);
 
@@ -617,6 +629,7 @@ static void print_usage(const char *prog)
         "  --token    TOKEN   Bearer 인증 토큰\n"
         "  --log      FILE    NDJSON 이벤트 로그 파일 경로\n"
         "  --rules    FILE    YAML 룰 설정 파일 (기본값: 내장 기본값 사용)\n"
+        "  --socket   PATH    명령 수신 소켓 경로 (기본값: /run/edr-agent.sock)\n"
         "  --alerts-only      HTTP 전송: alert 있는 이벤트만 전송\n"
         "  --help             이 도움말\n", prog);
 }
@@ -625,6 +638,7 @@ int main(int argc, char **argv)
 {
     /* ── 인자 파싱 ────────────────────────────────────────────────────── */
     std::string endpoint, token, logpath, rulespath;
+    std::string sockpath = ActionServer::DEFAULT_SOCK;
     bool alerts_only = false;
 
     static const option longopts[] = {
@@ -632,18 +646,20 @@ int main(int argc, char **argv)
         {"token",       required_argument, nullptr, 't'},
         {"log",         required_argument, nullptr, 'l'},
         {"rules",       required_argument, nullptr, 'r'},
+        {"socket",      required_argument, nullptr, 's'},
         {"alerts-only", no_argument,       nullptr, 'a'},
         {"help",        no_argument,       nullptr, 'h'},
         {nullptr, 0, nullptr, 0}
     };
 
     int opt;
-    while ((opt = getopt_long(argc, argv, "e:t:l:r:ah", longopts, nullptr)) != -1) {
+    while ((opt = getopt_long(argc, argv, "e:t:l:r:s:ah", longopts, nullptr)) != -1) {
         switch (opt) {
         case 'e': endpoint    = optarg; break;
         case 't': token       = optarg; break;
         case 'l': logpath     = optarg; break;
         case 'r': rulespath   = optarg; break;
+        case 's': sockpath    = optarg; break;
         case 'a': alerts_only = true;   break;
         case 'h': print_usage(argv[0]); return 0;
         default:  print_usage(argv[0]); return 1;
@@ -717,6 +733,28 @@ int main(int argc, char **argv)
                     g_rules.hash_db_path.c_str());
         g_hash = &hash_chk;
     }
+
+    /* ── Self-Defense 초기화 ────────────────────────────────────────────
+     *
+     * 1. PR_SET_DUMPABLE=0: /proc/<pid>/mem 접근 차단.
+     *    비루트 프로세스가 ptrace(ATTACH)를 시도하면 EPERM 으로 차단된다.
+     *    (루트 프로세스는 여전히 추적 가능 — BPF 훅으로 감지 후 즉시 종료)
+     *
+     * 2. g_agent_pid 저장: ptrace 이벤트 핸들러에서 자신을 추적하는
+     *    시도를 감지하면 추적자를 SIGKILL로 즉시 종료한다.
+     */
+    g_agent_pid = getpid();
+    if (prctl(PR_SET_DUMPABLE, 0) == 0)
+        fprintf(stderr, "[*] self-defense: PR_SET_DUMPABLE=0 (ptrace 방어 활성화)\n");
+    else
+        fprintf(stderr, "[!] self-defense: prctl 실패: %s\n", strerror(errno));
+
+    /* ── ActionServer 초기화 ─────────────────────────────────────────── */
+    ActionServer action_server(sockpath);
+    action_server.set_stats_fn([&]() -> AgentStats {
+        return {g_n_proc, g_n_file, g_n_net, g_n_mem, g_n_dns, g_n_ns};
+    });
+    action_server.start();
 
     /* ── 시그널 & libbpf ──────────────────────────────────────────────── */
     signal(SIGINT,  sig_handler);
@@ -870,6 +908,7 @@ int main(int argc, char **argv)
     }
 
 cleanup:
+    action_server.stop();
     g_feeds = nullptr;
     feed_mgr.stop();
     g_hash  = nullptr;

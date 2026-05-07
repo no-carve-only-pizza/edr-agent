@@ -95,8 +95,11 @@ ns_monitor.bpf.c     ──┘  unshare()   ├─ URLhaus domain  → R-026
 - **YAML 룰 외부화**: `--rules rules.yaml` 로 화이트리스트/블랙리스트/포트/피드 URL을 재컴파일 없이 교체
 - **화이트리스트 FP 억제**: 정상 프로세스(sshd, apt, dockerd, gdb 등) 노이즈 필터
 - **알림 중복 억제(dedup)**: (rule_id, comm) 키, 3초 윈도우 내 재발화 억제
+- **능동 대응(Active Response)**: Unix 도메인 소켓으로 실시간 kill 명령 수신 (`demo/edr-ctl.sh`)
+- **에이전트 자가 보호(Self-Defense)**: `PR_SET_DUMPABLE=0` + ptrace 탐지 시 추적자 즉시 종료
 - **NDJSON + HTTP POST**: libcurl로 백엔드 엔드포인트에 이벤트 전송, Bearer 토큰 인증
 - **세션 통계**: Ctrl+C 시 이벤트 수·룰별 발화 횟수 요약
+- **systemd 서비스**: `config/edr-agent.service` 로 프로덕션 배포
 
 ## 요구사항
 
@@ -123,11 +126,54 @@ sudo ./build/edr-agent
 
 # 전체 옵션
 sudo ./build/edr-agent \
-  --rules    config/rules.yaml \        # YAML 룰 파일 (없으면 기본값)
+  --rules    config/rules.yaml \         # YAML 룰 파일 (없으면 기본값)
   --endpoint http://backend:8888/ingest \
   --token    YOUR_TOKEN \
   --log      /var/log/edr/events.ndjson \
+  --socket   /run/edr-agent.sock \       # 명령 수신 소켓 (기본값)
   --alerts-only                          # alert 있는 이벤트만 HTTP 전송
+```
+
+## 능동 대응 (Active Response)
+
+에이전트가 실행 중인 상태에서 `demo/edr-ctl.sh`로 실시간 명령을 전송한다.
+
+```bash
+chmod +x demo/edr-ctl.sh
+
+# 에이전트 응답 확인
+./demo/edr-ctl.sh ping
+# → {"ok":true,"msg":"pong"}
+
+# 이벤트 통계 조회
+./demo/edr-ctl.sh status
+# → {"ok":true,"procs":532,"files":1823,"net":940,...}
+
+# 의심 프로세스 즉시 종료 (SIGKILL)
+./demo/edr-ctl.sh kill 1234
+# → {"ok":true,"msg":"sent sig 9 to pid 1234"}
+
+# SIGTERM 전송
+./demo/edr-ctl.sh kill 1234 15
+```
+
+## 배포 (systemd)
+
+```bash
+# 바이너리 및 설정 파일 설치
+sudo cp build/edr-agent /usr/local/bin/
+sudo mkdir -p /etc/edr-agent
+sudo cp config/rules.yaml /etc/edr-agent/
+sudo cp config/known_hashes.txt /etc/edr-agent/
+
+# systemd 서비스 등록
+sudo cp config/edr-agent.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now edr-agent
+
+# 상태 확인
+sudo systemctl status edr-agent
+sudo journalctl -u edr-agent -f
 ```
 
 ## 출력 예시
@@ -197,7 +243,8 @@ edr-agent/
 ├── CMakeLists.txt
 ├── config/
 │   ├── rules.yaml                  # 외부 YAML 룰 설정
-│   └── known_hashes.txt            # 알려진 악성 파일 SHA-256 해시 DB
+│   ├── known_hashes.txt            # 알려진 악성 파일 SHA-256 해시 DB
+│   └── edr-agent.service           # systemd 서비스 유닛 파일
 ├── include/
 │   └── common.h                    # BPF ↔ 유저스페이스 공유 구조체
 ├── bpf/
@@ -221,6 +268,8 @@ edr-agent/
 │   │   └── hash_checker.cpp/h      # SHA-256 해시 DB 조회 (R-027)
 │   ├── anomaly/
 │   │   └── behavior_profiler.cpp/h # EWMA + Z-점수 행동 이상 탐지 (R-028)
+│   ├── action/
+│   │   └── action_server.cpp/h     # Unix 소켓 능동 대응 수신부
 │   └── output/
 │       ├── json_fmt.cpp/h          # NDJSON 직렬화
 │       └── http_reporter.cpp/h     # libcurl HTTP POST 리포터
@@ -230,7 +279,9 @@ edr-agent/
     ├── 02_fileless.sh              # R-017/R-022 파일리스 시연
     ├── 03_backdoor.sh              # R-004/R-006/R-007 시연
     ├── 04_ptrace.sh                # R-014/R-019 ptrace 시연
-    └── 05_dns_tunnel.sh            # R-018 DNS 터널링 시연
+    ├── 05_dns_tunnel.sh            # R-018 DNS 터널링 시연
+    ├── edr-ctl.sh                  # 능동 대응 제어 클라이언트
+    └── stress_test.sh              # 스트레스 테스트 (ring_buffer 부하)
 ```
 
 *소스코드: https://github.com/no-carve-only-pizza/edr-agent*

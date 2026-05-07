@@ -1,0 +1,44 @@
+[Unit]
+Description=EDR Agent (eBPF-based Endpoint Detection and Response)
+Documentation=https://github.com/no-carve-only-pizza/edr-agent
+After=network.target
+# BTF 가 마운트된 후 시작 (eBPF CO-RE 필수)
+ConditionPathExists=/sys/kernel/btf/vmlinux
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/edr-agent \
+    --rules  /etc/edr-agent/rules.yaml \
+    --log    /var/log/edr-agent/events.ndjson \
+    --socket /run/edr-agent.sock
+
+# 루트 권한 필수 (eBPF 프로그램 로드, BPF syscall)
+User=root
+Group=root
+
+# 로그 디렉터리 자동 생성
+RuntimeDirectory=edr-agent
+LogsDirectory=edr-agent
+ConfigurationDirectory=edr-agent
+
+# 비정상 종료 시 5초 후 재시작
+Restart=on-failure
+RestartSec=5s
+
+# 커널 eBPF 로드에 필요한 최소 Capability
+# CAP_BPF + CAP_PERFMON: eBPF 프로그램 로드 및 perf 링버퍼
+# CAP_SYS_ADMIN: BTF 파일 접근, 일부 BPF map 타입
+# CAP_KILL: 능동 대응 kill() 명령
+# CAP_NET_ADMIN: 네트워크 이벤트 tracepoint
+AmbientCapabilities=CAP_BPF CAP_PERFMON CAP_SYS_ADMIN CAP_KILL CAP_NET_ADMIN
+CapabilityBoundingSet=CAP_BPF CAP_PERFMON CAP_SYS_ADMIN CAP_KILL CAP_NET_ADMIN
+
+# 보안 강화
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ReadWritePaths=/var/log/edr-agent /run
+
+[Install]
+WantedBy=multi-user.target
