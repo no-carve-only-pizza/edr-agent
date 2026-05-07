@@ -56,6 +56,7 @@
 #define EVENT_FILE_RENAME 4u  /* sys_enter_renameat2: rename()/renameat2()   */
 #define EVENT_NET_CONNECT 5u  /* sys_enter_connect: 아웃바운드 연결 시도     */
 #define EVENT_NET_BIND    6u  /* sys_enter_bind: 포트 바인드(서버 오픈)      */
+#define EVENT_PROC_EXIT   7u  /* sched_process_exit: 프로세스 정상 종료      */
 
 /* ── 구조체 정의 ─────────────────────────────────────────────────────── */
 
@@ -136,6 +137,23 @@ struct net_event {
     __u64 ts_ns;               /* bpf_ktime_get_ns()                     */
     char  comm[TASK_COMM_LEN]; /* task_struct.comm                       */
     __u8  daddr[16];           /* 대상/로컬 IP 주소                      */
+};
+
+/*
+ * exit_event: 프로세스 종료 이벤트.
+ *
+ * sched_process_exit 트레이스포인트에서 캡처.
+ * 스레드(TID != TGID) 종료는 BPF 측에서 필터링하여 프로세스 리더 종료만 전달.
+ *
+ * exit_code: task_struct.exit_code
+ *   상위 8비트 = 정상 종료 코드 (exit(N) → exit_code = N << 8)
+ *   하위 8비트 = 종료 시그널 번호 (시그널 종료 시)
+ */
+struct exit_event {
+    __u32 pid;
+    __u32 exit_code;
+    __u64 ts_ns;
+    char  comm[TASK_COMM_LEN];
 };
 
 #endif /* EDR_COMMON_H */
