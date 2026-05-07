@@ -203,6 +203,7 @@ add_executable(edr-agent
     src/threat_intel/feed_manager.cpp
     src/threat_intel/hash_checker.cpp
     src/anomaly/behavior_profiler.cpp
+    src/action/action_server.cpp
 )
 
 add_dependencies(edr-agent bpf_build)
