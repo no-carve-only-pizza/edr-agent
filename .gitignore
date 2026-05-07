@@ -8,3 +8,4 @@ compile_commands.json
 *.log
 test_mmap
 test_mmap.c
+report_week*.md
