@@ -31,6 +31,19 @@
 /* 파일 경로 저장 한도: 링버퍼 슬롯에서 할당하므로 256 사용 */
 #define MAX_PATH_LEN     256
 
+/*
+ * argv 캡처 상수 (sys_enter_execve 훅에서 사용):
+ *
+ *   MAX_ARGV_LEN: NUL 구분 argv 연결 버퍼 크기.
+ *                 /proc/<pid>/cmdline 과 동일한 형식으로 저장.
+ *                 링버퍼 슬롯에 할당되므로 스택 제약 없음.
+ *
+ *   MAX_ARGC:     캡처할 최대 인자 수. BPF 검증기(verifier)가
+ *                 #pragma unroll 루프를 정적으로 분석하기 위해 상수 필요.
+ */
+#define MAX_ARGV_LEN 256
+#define MAX_ARGC       8
+
 /* ── 이벤트 타입 ─────────────────────────────────────────────────────── */
 
 /*
@@ -50,15 +63,21 @@
  * process_event: sched_process_exec 트레이스포인트에서 캡처.
  * execve() 가 새 바이너리를 VAS 에 매핑한 직후 발화하므로
  * 실패한 exec 는 포함되지 않는다.
+ *
+ * argv / argc 채우기 경로:
+ *   1. sys_enter_execve BPF 훅에서 argv[] 를 읽어 argv_store 맵에 임시 저장.
+ *   2. sched_process_exec BPF 훅에서 argv_store 를 조회·복사 후 맵에서 삭제.
+ *   argc == 0 이면 캡처 실패(exec 경쟁, execveat 경유 등).
  */
 struct process_event {
-    __u32 pid;                        /* 유저스페이스 PID = 커널 TGID       */
+    __u32 pid;                        /* 유저스페이스 PID = 커널 TGID        */
     __u32 ppid;                       /* 부모 프로세스 ID (real_parent.tgid) */
-    __u32 uid;                        /* 실효 UID                           */
-    __u32 _pad;                       /* ts_ns 8-byte 정렬용 명시적 패딩    */
-    __u64 ts_ns;                      /* bpf_ktime_get_ns(): 부팅 이후 ns   */
-    char  comm[TASK_COMM_LEN];        /* task_struct.comm (basename)        */
-    char  filename[MAX_FILENAME_LEN]; /* execve() 에 전달된 실행 파일 경로  */
+    __u32 uid;                        /* 실효 UID                            */
+    __u32 argc;                       /* 캡처된 argv 인자 수 (0 = 미캡처)   */
+    __u64 ts_ns;                      /* bpf_ktime_get_ns(): 부팅 이후 ns    */
+    char  comm[TASK_COMM_LEN];        /* task_struct.comm (basename)         */
+    char  filename[MAX_FILENAME_LEN]; /* execve() 에 전달된 실행 파일 경로   */
+    char  argv[MAX_ARGV_LEN];         /* argv 연결 버퍼: NUL 구분, cmdline 형식 */
 };
 
 /*
