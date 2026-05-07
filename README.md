@@ -30,6 +30,8 @@ sys_enter_bind
 | R-008 | root 권한 인터프리터 실행 | critical |
 | R-009 | `/tmp` → 시스템 경로 rename (TOCTOU 의심) | critical |
 | R-010 | 인터프리터 `-c`/`-e` 인라인 페이로드 실행 (파일리스 공격 의심) | high |
+| R-011 | 웹 서버 자식 셸 실행 (nginx/apache → bash, 웹셸 의심) | critical |
+| R-012 | DB 서버 자식 셸 실행 (mysqld/postgres → bash, SQLi RCE 의심) | critical |
 
 ## 요구사항
 

@@ -237,6 +237,75 @@ std::vector<RuleMatch> match_rules(const net_event &e)
     return hits;
 }
 
+/* ── 프로세스 트리 기반 룰 ──────────────────────────────────────────────── */
+
+/*
+ * 웹 서버: HTTP 요청을 받아 처리하는 서비스.
+ * 이 목록의 프로세스가 셸/인터프리터를 직접 exec() 하면 웹셸 실행으로 판단.
+ * MITRE ATT&CK T1190 (Exploit Public-Facing Application) + T1059.
+ */
+static const char *WEB_SERVERS[] = {
+    "nginx", "apache", "apache2", "httpd", "lighttpd",
+    "caddy", "traefik", "gunicorn", "uwsgi", "php-fpm",
+    nullptr
+};
+
+/*
+ * DB 서버: SQL/NoSQL 데이터베이스 데몬.
+ * 셸을 직접 spawn 하는 경우는 SQL injection → OS command execution 의심.
+ * MITRE ATT&CK T1190 + T1059.
+ */
+static const char *DB_SERVERS[] = {
+    "mysqld", "mysqld_safe", "mariadbd",
+    "postgres", "postmaster",
+    "mongod", "redis-server", "memcached",
+    nullptr
+};
+
+/*
+ * 유닉스 셸: 인터랙티브/스크립트 실행 셸.
+ * 서비스 데몬이 이 목록을 직접 exec() 하면 명령 실행(RCE) 의심.
+ */
+static const char *SHELLS[] = {
+    "bash", "sh", "dash", "zsh", "ksh", "fish", "tcsh", "csh",
+    nullptr
+};
+
+std::vector<RuleMatch> match_rules(const process_event &e, const char *parent_comm)
+{
+    /* 기존 단독 이벤트 룰 먼저 수집 */
+    auto hits = match_rules(e);
+
+    if (!parent_comm || parent_comm[0] == '\0')
+        return hits;
+
+    bool child_is_shell = comm_in(e.comm, SHELLS);
+    bool child_is_interp = comm_in(e.comm, INTERPRETERS);
+
+    /*
+     * R-011: 웹 서버 자식 프로세스가 셸 또는 인터프리터를 실행.
+     *
+     * 정상 경로: nginx worker → [요청 처리] (fork/exec 없음)
+     * 이상 경로: nginx → bash  ← 웹셸이 system() / proc_open() 호출
+     *
+     * PHP-FPM 이 php 스크립트를 exec() 하는 것은 정상이지만,
+     * php-fpm → bash 는 비정상이다.
+     */
+    if (comm_in(parent_comm, WEB_SERVERS) && (child_is_shell || child_is_interp))
+        hits.push_back({"R-011", "웹 서버 자식 셸 실행 (웹셸/RCE 의심)", "critical"});
+
+    /*
+     * R-012: DB 서버 자식 프로세스가 셸 또는 인터프리터를 실행.
+     *
+     * mysqld → bash : SQL injection + INTO OUTFILE + xp_cmdshell 유사 패턴
+     * postgres → sh : COPY TO PROGRAM 을 통한 OS 명령 실행 (CVE-2019-9193 류)
+     */
+    if (comm_in(parent_comm, DB_SERVERS) && (child_is_shell || child_is_interp))
+        hits.push_back({"R-012", "DB 서버 자식 셸 실행 (SQLi RCE 의심)", "critical"});
+
+    return hits;
+}
+
 /* ── 유틸리티 ───────────────────────────────────────────────────────────── */
 
 const char *severity_color(const char *severity)
