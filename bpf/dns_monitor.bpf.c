@@ -155,34 +155,45 @@ int handle_sendto(struct trace_event_raw_sys_enter *ctx)
      *
      * DNS 압축 포인터(len >= 0xC0): 단순화를 위해 파싱 중단.
      */
+    /*
+     * QNAME 파싱: flat 단일 루프 (중첩 #pragma unroll 제거)
+     *
+     * 중첩 unroll(10×63=630회)은 BPF verifier 복잡도 한계를 초과한다.
+     * 커널 5.3+ 는 bounded loop 를 verifier 가 직접 지원하므로
+     * 단일 루프로 재작성해 verifier 상태 공간을 줄인다.
+     *
+     * 상태 변수:
+     *   label_left: 현재 레이블에서 남은 바이트 수 (0이면 다음 길이 바이트 읽기)
+     *   need_dot  : 다음 레이블 앞에 '.' 삽입 여부
+     */
     __builtin_memset(e->name, 0, sizeof(e->name));
-    __u32 out = 0;
-    __u32 pos = 12; /* QNAME 시작 오프셋 */
+    __u32 out       = 0;
+    __u32 pos       = 12; /* QNAME 시작 오프셋 (DNS 헤더 12바이트 이후) */
+    __u8  label_left = 0;
+    __u8  need_dot   = 0;
 
-    #pragma unroll
-    for (int label = 0; label < 10; label++) {
-        if (pos >= DNS_BUF_LEN) break;
+    /* 최대 115 바이트 순회 (DNS_BUF_LEN=128, 헤더 12, 마지막 NUL 1 제외) */
+    for (int i = 0; i < 115; i++) {
+        if (pos >= DNS_BUF_LEN || out >= DNS_NAME_MAX - 1) break;
 
-        __u8 len = raw[pos & (DNS_BUF_LEN - 1)]; /* 길이 바이트 */
-        if (len == 0 || len > 63) break;          /* QNAME 종료 또는 압축 포인터 */
+        __u8 b = raw[pos & (DNS_BUF_LEN - 1)];
         pos++;
 
-        /* 레이블 사이에 점 삽입 */
-        if (out > 0 && out < DNS_NAME_MAX - 1) {
-            e->name[out & (DNS_NAME_MAX - 1)] = '.';
+        if (label_left == 0) {
+            /* 길이 바이트 */
+            if (b == 0 || b > 63) break; /* QNAME 종료 또는 압축 포인터 */
+            if (need_dot) {
+                e->name[out & (DNS_NAME_MAX - 1)] = '.';
+                out++;
+            }
+            label_left = b;
+            need_dot   = 1;
+        } else {
+            /* 레이블 문자 */
+            e->name[out & (DNS_NAME_MAX - 1)] = (char)b;
             out++;
+            label_left--;
         }
-
-        /* 레이블 문자 복사 (최대 63자) */
-        #pragma unroll
-        for (int c = 0; c < 63; c++) {
-            if ((__u32)c >= (__u32)len)   break;
-            if (out >= DNS_NAME_MAX - 1)   break;
-            __u32 src = (pos + (__u32)c) & (DNS_BUF_LEN - 1);
-            e->name[out & (DNS_NAME_MAX - 1)] = (char)raw[src];
-            out++;
-        }
-        pos += len;
     }
     /* NUL 종료: __builtin_memset 으로 이미 0 초기화됨 */
 
