@@ -42,6 +42,8 @@ bool RuleConfig::load(const std::string &path)
     ptrace_whitelist.clear(); memfd_whitelist.clear();
     dns_whitelist.clear();    ns_escape_whitelist.clear();
     abused_tlds.clear();      common_ports.clear();
+    ip_feed_url.clear();      domain_feed_url.clear();
+    hash_db_path.clear();     feed_update_hours = 6;
 
     /*
      * 섹션 이름 → 문자열 벡터 포인터 맵.
@@ -93,12 +95,37 @@ bool RuleConfig::load(const std::string &path)
             continue;
         }
 
-        /* 섹션 헤더: "key:" (콜론으로 끝나는 줄) */
-        if (!t.empty() && t.back() == ':') {
-            std::string key = t.substr(0, t.size() - 1);
-            cur_port = (key == "common_ports");
-            auto it = str_map.find(key);
-            cur_str = (it != str_map.end()) ? it->second : nullptr;
+        /* 스칼라 값: "key: value" (콜론 이후에 내용이 있는 줄) */
+        {
+            size_t colon = t.find(':');
+            if (colon != std::string::npos && colon + 1 < t.size()) {
+                std::string key = trim(t.substr(0, colon));
+                std::string val = trim(t.substr(colon + 1));
+                if (!val.empty() && val[0] != '#') {
+                    cur_str  = nullptr;
+                    cur_port = false;
+                    if      (key == "ip_feed_url")       ip_feed_url       = val;
+                    else if (key == "domain_feed_url")   domain_feed_url   = val;
+                    else if (key == "hash_db_path")      hash_db_path      = val;
+                    else if (key == "feed_update_hours") {
+                        char *ep;
+                        long h = std::strtol(val.c_str(), &ep, 10);
+                        if (ep != val.c_str() && h > 0) feed_update_hours = (int)h;
+                    }
+                    continue;
+                }
+            }
+        }
+
+        /* 섹션 헤더: "key:" (콜론으로 끝나는 줄 또는 콜론 이후 공백/주석) */
+        {
+            size_t colon = t.find(':');
+            if (colon != std::string::npos) {
+                std::string key = trim(t.substr(0, colon));
+                cur_port = (key == "common_ports");
+                auto it = str_map.find(key);
+                cur_str = (it != str_map.end()) ? it->second : nullptr;
+            }
         }
     }
 

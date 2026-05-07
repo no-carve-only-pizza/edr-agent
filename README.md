@@ -2,7 +2,7 @@
 
 리눅스용 경량 EDR(Endpoint Detection & Response) 에이전트.  
 eBPF 트레이스포인트로 프로세스·파일·네트워크·메모리·DNS·네임스페이스 이벤트를 실시간 감시하고,  
-단일 이벤트 룰 + 이벤트 상관 분석으로 24가지 공격 패턴을 탐지한다.
+단일 이벤트 룰 + 이벤트 상관 분석 + 위협 인텔리전스 피드 + EWMA 행동 이상 탐지로 **28가지 공격 패턴**을 탐지한다.
 
 ## 아키텍처
 
@@ -19,13 +19,15 @@ file_monitor.bpf.c   ──┤  (mmap)    ─▶ dedup_alerts()   ─▶ NDJSON 
 network_monitor.bpf.c ─┤              CorrelationEngine  → [CORRL] 상관 패턴
   connect/bind         │              .feed(pid,evt,ts)
 memory_monitor.bpf.c ──┤
-  mmap/mprotect        │
-  memfd_create         │
-dns_monitor.bpf.c    ──┤  UDP:53 필터 + QNAME 파싱 in BPF
-ns_monitor.bpf.c     ──┘  unshare() + PID ns inum 비교
+  mmap/mprotect        │                   │
+  memfd_create         │              FeedManager (백그라운드)
+dns_monitor.bpf.c    ──┤  QNAME 파싱   ├─ Feodo Tracker IP → R-025
+ns_monitor.bpf.c     ──┘  unshare()   ├─ URLhaus domain  → R-026
+                                       └─ HashChecker (SHA-256) → R-027
+                                       BehaviorProfiler (EWMA) → R-028
 ```
 
-## 탐지 룰 (R-001 ~ R-024)
+## 탐지 룰 (R-001 ~ R-028)
 
 ### 단일 이벤트 룰
 
@@ -53,6 +55,20 @@ ns_monitor.bpf.c     ──┘  unshare() + PID ns inum 비교
 | R-018c | 남용 TLD 접속 (`.tk`/`.ml`/`.ga`/`.cf`/`.gq` 등) | medium |
 | R-024 | 컨테이너 탈출 시도 (unshare + PID ns 비교) | critical/high |
 
+### 위협 인텔리전스 룰 (R-025~R-027)
+
+| ID | 이름 | 심각도 | 피드 소스 |
+|---|---|---|---|
+| R-025 | 알려진 C2 서버 IP 연결 | critical | Feodo Tracker (자동 갱신) |
+| R-026 | 악성 도메인 DNS 조회 | critical | URLhaus (자동 갱신) |
+| R-027 | 알려진 악성 파일 해시 실행 | critical | MalwareBazaar (config/known_hashes.txt) |
+
+### EWMA 행동 이상 탐지 (R-028)
+
+| ID | 지표 | 탐지 조건 | 심각도 |
+|---|---|---|---|
+| R-028 | net_connect / file_write / exec (60s 윈도우) | Z-점수 ≥ 3.0, 학습 윈도우 ≥ 3 | high |
+
 ### 이벤트 상관 분석 룰 (R-019~R-023)
 
 같은 PID의 이벤트를 슬라이딩 윈도우(30~60초)로 추적해 다단계 공격 체인을 탐지한다.
@@ -73,7 +89,10 @@ ns_monitor.bpf.c     ──┘  unshare() + PID ns inum 비교
 - **DNS BPF 파싱**: QNAME 와이어 포맷을 BPF 내부에서 직접 파싱 (AND 마스크로 Verifier 통과)
 - **컨테이너 탐지**: CO-RE로 PID ns inum 읽기, init ns inum과 비교 (`/proc/1/ns/pid`)
 - **이벤트 상관 분석**: PID별 deque 슬라이딩 윈도우, 5가지 다단계 공격 패턴 탐지
-- **YAML 룰 외부화**: `--rules rules.yaml` 로 화이트리스트/블랙리스트/포트를 재컴파일 없이 교체
+- **위협 인텔리전스 피드**: Feodo Tracker IP + URLhaus 도메인 주기적 자동 갱신 (백그라운드 스레드)
+- **파일 해시 탐지**: SHA-256 헤더 전용 구현 + MalwareBazaar 해시 DB 대조 (R-027)
+- **EWMA 행동 이상 탐지**: 프로세스별 연결/파일/exec 빈도 Z-점수 기반 이상 탐지 (R-028)
+- **YAML 룰 외부화**: `--rules rules.yaml` 로 화이트리스트/블랙리스트/포트/피드 URL을 재컴파일 없이 교체
 - **화이트리스트 FP 억제**: 정상 프로세스(sshd, apt, dockerd, gdb 등) 노이즈 필터
 - **알림 중복 억제(dedup)**: (rule_id, comm) 키, 3초 윈도우 내 재발화 억제
 - **NDJSON + HTTP POST**: libcurl로 백엔드 엔드포인트에 이벤트 전송, Bearer 토큰 인증
@@ -177,7 +196,8 @@ common_ports:
 edr-agent/
 ├── CMakeLists.txt
 ├── config/
-│   └── rules.yaml                  # 외부 YAML 룰 설정
+│   ├── rules.yaml                  # 외부 YAML 룰 설정
+│   └── known_hashes.txt            # 알려진 악성 파일 SHA-256 해시 DB
 ├── include/
 │   └── common.h                    # BPF ↔ 유저스페이스 공유 구조체
 ├── bpf/
@@ -195,6 +215,12 @@ edr-agent/
 │   │   └── rule_config.cpp/h       # YAML 파서 + RuleConfig 구조체
 │   ├── correlation/
 │   │   └── correlator.cpp/h        # 슬라이딩 윈도우 상관 분석 엔진
+│   ├── threat_intel/
+│   │   ├── sha256.h                # SHA-256 헤더 전용 구현 (외부 의존성 없음)
+│   │   ├── feed_manager.cpp/h      # Feodo Tracker IP + URLhaus 도메인 피드
+│   │   └── hash_checker.cpp/h      # SHA-256 해시 DB 조회 (R-027)
+│   ├── anomaly/
+│   │   └── behavior_profiler.cpp/h # EWMA + Z-점수 행동 이상 탐지 (R-028)
 │   └── output/
 │       ├── json_fmt.cpp/h          # NDJSON 직렬화
 │       └── http_reporter.cpp/h     # libcurl HTTP POST 리포터

@@ -288,3 +288,18 @@ common_ports:
   - 10250
   - 2375
   - 2376
+
+# ── 위협 인텔리전스 설정 (R-025/R-026/R-027) ─────────────────────────────
+# 스칼라 값: "key: value" 형식 (목록이 아님)
+
+# Feodo Tracker C2 IP 블록리스트 (R-025)
+ip_feed_url: https://feodotracker.abuse.ch/downloads/ipblocklist.txt
+
+# URLhaus 악성 도메인 피드 (R-026)
+domain_feed_url: https://urlhaus.abuse.ch/downloads/text_online/
+
+# 알려진 악성 파일 해시 DB 경로 (R-027, 빈 줄이면 미사용)
+hash_db_path: config/known_hashes.txt
+
+# 피드 갱신 주기 (시간, 기본 6)
+feed_update_hours: 6

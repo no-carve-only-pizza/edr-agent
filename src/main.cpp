@@ -59,6 +59,10 @@
 #include "output/http_reporter.h"
 #include "proc_tree.h"
 #include "correlation/correlator.h"
+#include "threat_intel/feed_manager.h"
+#include "threat_intel/hash_checker.h"
+#include "anomaly/behavior_profiler.h"
+#include <ctime>
 
 /* ── 전역 상태 ─────────────────────────────────────────────────────────── */
 
@@ -67,6 +71,9 @@ static FILE              *g_logfile    = nullptr;
 static HttpReporter      *g_reporter   = nullptr;
 static ProcTree           g_proc_tree;
 static CorrelationEngine  g_correlator;
+static FeedManager       *g_feeds      = nullptr;
+static HashChecker       *g_hash       = nullptr;
+static BehaviorProfiler   g_profiler;
 
 /*
  * 알림 중복 억제 (dedup):
@@ -81,6 +88,10 @@ static CorrelationEngine  g_correlator;
  */
 static std::unordered_map<std::string, uint64_t> g_dedup; /* key → last ts_ns */
 static constexpr uint64_t DEDUP_NS = 3ULL * 1'000'000'000ULL; /* 3초 */
+
+/* 이상 탐지 알림 중복 억제: 같은 (comm, metric) 은 5분 이내 재발화 억제 */
+static std::unordered_map<std::string, uint64_t> g_anomaly_dedup;
+static constexpr uint64_t ANOMALY_DEDUP_NS = 300ULL * 1'000'000'000ULL; /* 5분 */
 
 /* ── UID → 사용자 이름 캐시 ─────────────────────────────────────────────── */
 
@@ -140,6 +151,7 @@ static int libbpf_print_cb(enum libbpf_print_level level,
 #define RESET   "\033[0m"
 #define BOLD    "\033[1m"
 #define MAGENTA "\033[1;35m"
+#define CYAN    "\033[1;36m"
 
 /* alert 배열을 터미널에 출력 */
 static void print_alerts(const std::vector<RuleMatch> &hits)
@@ -208,6 +220,54 @@ static void emit_correlation(uint32_t pid, const char *comm, uint64_t ts_ns,
     emit(j, true);
 }
 
+/* R-025/R-026: 위협 인텔 룰 매치를 hits 에 추가 (dedup 포함) */
+static void maybe_add_ti_alert(std::vector<RuleMatch> &hits,
+                                const char *id, const char *name, const char *sev,
+                                const char *comm, uint64_t ts_ns)
+{
+    std::string key = std::string(id) + ":" + comm;
+    auto it = g_dedup.find(key);
+    if (it != g_dedup.end() && ts_ns - it->second < DEDUP_NS) return;
+    g_dedup[key] = ts_ns;
+    hits.push_back({id, name, sev});
+    g_rule_counts[id]++;
+}
+
+/* R-028: 이상 탐지 알림 출력 + JSON 전송 */
+static void emit_anomaly(const AnomalyHit &h, uint64_t ts_ns)
+{
+    std::string key = h.comm + ":" + h.metric;
+    auto it = g_anomaly_dedup.find(key);
+    if (it != g_anomaly_dedup.end() && ts_ns - it->second < ANOMALY_DEDUP_NS) return;
+    g_anomaly_dedup[key] = ts_ns;
+    g_rule_counts["R-028"]++;
+
+    printf("%s[ANOML]%s %9.3fs  comm=%-16s  metric=%-12s  obs=%.0f  mean=%.1f  z=%.1f\n",
+           CYAN, RESET, (double)ts_ns / 1e9,
+           h.comm.c_str(), h.metric.c_str(), h.observed, h.mean, h.zscore);
+    printf("  %s%s[ALERT] R-028 | 행동 이상 탐지 (EWMA Z=%.1f, 임계값=%.1f)%s\n",
+           BOLD, CYAN, h.zscore, BehaviorProfiler::Z_THRESHOLD, RESET);
+
+    char buf[64];
+    std::string j = "{\"type\":\"anomaly\"";
+    snprintf(buf, sizeof(buf), "%.3f", (double)ts_ns / 1e9);
+    j += ",\"ts\":"; j += buf;
+    j += ",\"comm\":"; j += json_esc(h.comm.c_str());
+    j += ",\"metric\":"; j += json_esc(h.metric.c_str());
+    snprintf(buf, sizeof(buf), "%.2f", h.observed);
+    j += ",\"observed\":"; j += buf;
+    snprintf(buf, sizeof(buf), "%.2f", h.mean);
+    j += ",\"mean\":"; j += buf;
+    snprintf(buf, sizeof(buf), "%.2f", h.stddev);
+    j += ",\"stddev\":"; j += buf;
+    snprintf(buf, sizeof(buf), "%.2f", h.zscore);
+    j += ",\"zscore\":"; j += buf;
+    j += ",\"alerts\":[{\"id\":\"R-028\""
+         ",\"name\":\"행동 이상 탐지 (EWMA 기반)\""
+         ",\"sev\":\"high\"}]}";
+    emit(j, true);
+}
+
 /* ── 이벤트 핸들러 ─────────────────────────────────────────────────────── */
 
 static int handle_proc_event(void *, void *data, size_t sz)
@@ -226,6 +286,16 @@ static int handle_proc_event(void *, void *data, size_t sz)
     g_proc_tree.update(e.pid, e.ppid, e.comm);
     g_n_proc++;
     for (const auto &h : hits) g_rule_counts[h.id]++;
+
+    /* R-027: 실행 파일 SHA-256 해시 → 알려진 악성 해시 DB 조회 */
+    if (g_hash && g_hash->check_file(e.filename)) {
+        maybe_add_ti_alert(hits, "R-027",
+            "알려진 악성 파일 해시 탐지 (MalwareBazaar)", "critical",
+            e.comm, e.ts_ns);
+        alert = true;
+    }
+
+    g_profiler.inc_exec(e.comm);
 
     printf("[EXEC ] %9.3fs  PID=%-6u PPID=%-6u %-12s  %-16s  %s\n",
            (double)e.ts_ns / 1e9, e.pid, e.ppid, uid_name(e.uid), e.comm, e.filename);
@@ -303,6 +373,10 @@ static int handle_file_event(void *, void *data, size_t sz)
         auto ch = g_correlator.feed(e.pid, CorrelEvt::WRITE_TMP, e.ts_ns);
         emit_correlation(e.pid, e.comm, e.ts_ns, ch);
     }
+
+    if (e.type == EVENT_FILE_WRITE)
+        g_profiler.inc_file_write(e.comm);
+
     return 0;
 }
 
@@ -316,6 +390,17 @@ static int handle_net_event(void *, void *data, size_t sz)
     double ts  = (double)e.ts_ns / 1e9;
     g_n_net++;
     for (const auto &h : hits) g_rule_counts[h.id]++;
+
+    /* R-025: Feodo Tracker C2 IP 연결 탐지 (IPv4 only) */
+    if (g_feeds && e.type == EVENT_NET_CONNECT && e.family == 2 /* AF_INET */) {
+        uint32_t ip4;
+        memcpy(&ip4, e.daddr, 4); /* network byte order */
+        if (g_feeds->is_c2_ip4(ip4))
+            maybe_add_ti_alert(hits, "R-025",
+                "알려진 C2 서버 IP 연결 탐지 (Feodo Tracker)", "critical",
+                e.comm, e.ts_ns);
+        alert = !hits.empty();
+    }
 
     char ip[INET6_ADDRSTRLEN] = {};
     inet_ntop((e.family == 10) ? AF_INET6 : AF_INET, e.daddr, ip, sizeof(ip));
@@ -344,6 +429,7 @@ static int handle_net_event(void *, void *data, size_t sz)
     if (e.type == EVENT_NET_CONNECT) {
         auto ch = g_correlator.feed(e.pid, CorrelEvt::NET_CONN, e.ts_ns);
         emit_correlation(e.pid, e.comm, e.ts_ns, ch);
+        g_profiler.inc_net_connect(e.comm);
     }
     return 0;
 }
@@ -419,6 +505,14 @@ static int handle_dns_event(void *, void *data, size_t sz)
     bool alert = !hits.empty();
     g_n_dns++;
     for (const auto &h : hits) g_rule_counts[h.id]++;
+
+    /* R-026: URLhaus 악성 도메인 DNS 조회 탐지 */
+    if (g_feeds && g_feeds->is_malicious_domain(e.name)) {
+        maybe_add_ti_alert(hits, "R-026",
+            "악성 도메인 DNS 조회 탐지 (URLhaus)", "critical",
+            e.comm, e.ts_ns);
+        alert = true;
+    }
 
     if (alert) {
         printf("[DNS  ] %9.3fs  PID=%-6u %-12s  %-16s  %s\n",
@@ -594,6 +688,36 @@ int main(int argc, char **argv)
     }
     init_rules(g_rules);
 
+    /* ── 위협 인텔리전스 초기화 ─────────────────────────────────────────
+     *
+     * FeedManager: 백그라운드 스레드로 Feodo Tracker IP 피드와 URLhaus 도메인
+     * 피드를 주기적으로 갱신한다. start() 는 즉시 반환하고 첫 페치는 백그라운드에서
+     * 실행되므로 에이전트 시작 지연 없음.
+     *
+     * HashChecker: known_hashes.txt 를 메모리에 로드한다.
+     * 해시 DB 경로가 없으면 R-027 비활성화.
+     */
+    FeedManager feed_mgr(g_rules.ip_feed_url,
+                         g_rules.domain_feed_url,
+                         g_rules.feed_update_hours);
+    feed_mgr.start();
+    g_feeds = &feed_mgr;
+    fprintf(stderr, "[*] 위협 인텔 피드 시작 (갱신 주기: %dh)\n",
+            g_rules.feed_update_hours);
+    fprintf(stderr, "    IP 피드: %s\n",    g_rules.ip_feed_url.c_str());
+    fprintf(stderr, "    도메인 피드: %s\n", g_rules.domain_feed_url.c_str());
+
+    HashChecker hash_chk;
+    if (!g_rules.hash_db_path.empty()) {
+        if (hash_chk.load(g_rules.hash_db_path))
+            fprintf(stderr, "[*] 해시 DB 로드: %s (%zu 개)\n",
+                    g_rules.hash_db_path.c_str(), hash_chk.count());
+        else
+            fprintf(stderr, "[!] 해시 DB 열기 실패: %s\n",
+                    g_rules.hash_db_path.c_str());
+        g_hash = &hash_chk;
+    }
+
     /* ── 시그널 & libbpf ──────────────────────────────────────────────── */
     signal(SIGINT,  sig_handler);
     signal(SIGTERM, sig_handler);
@@ -703,10 +827,20 @@ int main(int argc, char **argv)
     printf("%s\n", std::string(72, '-').c_str());
 
     /* ── 이벤트 폴 루프 ───────────────────────────────────────────────── */
+    uint64_t last_anomaly_tick = (uint64_t)time(nullptr);
     while (g_running) {
         err = ring_buffer__poll(rb, 100);
         if (err == -EINTR) { err = 0; break; }
         if (err < 0)       { fprintf(stderr, "[!] poll 에러: %d\n", err); break; }
+
+        /* R-028: 60초 윈도우마다 이상 탐지 점수 계산 */
+        uint64_t now_sec = (uint64_t)time(nullptr);
+        if (now_sec - last_anomaly_tick >= 30) {
+            last_anomaly_tick = now_sec;
+            uint64_t ts_ns = (uint64_t)now_sec * 1'000'000'000ULL;
+            for (const auto &h : g_profiler.tick(now_sec))
+                emit_anomaly(h, ts_ns);
+        }
     }
 
     printf("\n[*] 종료 중...\n");
@@ -736,6 +870,9 @@ int main(int argc, char **argv)
     }
 
 cleanup:
+    g_feeds = nullptr;
+    feed_mgr.stop();
+    g_hash  = nullptr;
     ring_buffer__free(rb);
     ns_monitor_bpf__destroy(ns_skel);
     dns_monitor_bpf__destroy(dns_skel);

@@ -50,6 +50,12 @@ struct RuleConfig {
     /* ── 포트 목록 ─────────────────────────────────────────────────────── */
     std::vector<uint16_t>    common_ports;        /* R-006: 일반 포트       */
 
+    /* ── 위협 인텔리전스 설정 (스칼라 값) ──────────────────────────────── */
+    std::string ip_feed_url    = "https://feodotracker.abuse.ch/downloads/ipblocklist.txt";
+    std::string domain_feed_url = "https://urlhaus.abuse.ch/downloads/text_online/";
+    std::string hash_db_path;            /* 빈 문자열 = 해시 DB 미사용    */
+    int         feed_update_hours = 6;   /* 피드 갱신 주기 (시간)         */
+
     /*
      * load(): YAML 파일에서 설정을 로드한다.
      * 파일을 열 수 없거나 알 수 없는 섹션이 있어도 파싱 가능한 항목은 처리한다.
