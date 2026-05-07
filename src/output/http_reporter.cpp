@@ -17,6 +17,7 @@
  *   이 PoC 에서는 단순성을 위해 동기 방식을 사용한다.
  */
 #include "output/http_reporter.h"
+#include <algorithm>
 #include <curl/curl.h>
 #include <cstdio>
 
@@ -26,6 +27,14 @@ HttpReporter::HttpReporter(std::string endpoint, std::string token,
     , token_(std::move(token))
     , alerts_only_(alerts_only)
 {
+    /*
+     * 헤더 인젝션 방지: token 에 CR/LF 가 포함되면
+     * "Authorization: Bearer <token>\r\nX-Evil: ..." 형태로 임의 헤더를
+     * 삽입할 수 있다. CLI 인자라도 파이프나 환경변수 경유 입력을 고려해 제거.
+     */
+    token_.erase(std::remove_if(token_.begin(), token_.end(),
+        [](char c){ return c == '\r' || c == '\n'; }), token_.end());
+
     if (!endpoint_.empty()) {
         /* curl_global_init() 은 프로세스 당 한 번만 호출해야 한다.
          * CURL_GLOBAL_DEFAULT: SSL + Win32 소켓 초기화 포함. */
