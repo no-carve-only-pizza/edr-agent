@@ -31,11 +31,14 @@
 #include <algorithm>
 #include <arpa/inet.h>
 #include <cerrno>
+#include <cinttypes>
 #include <csignal>
 #include <cstdio>
 #include <cstring>
+#include <pwd.h>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 #include <getopt.h>
 
@@ -70,6 +73,34 @@ static ProcTree      g_proc_tree;
  */
 static std::unordered_map<std::string, uint64_t> g_dedup; /* key → last ts_ns */
 static constexpr uint64_t DEDUP_NS = 3ULL * 1'000'000'000ULL; /* 3초 */
+
+/* ── UID → 사용자 이름 캐시 ─────────────────────────────────────────────── */
+
+/*
+ * uid_name(): UID를 사용자 이름으로 변환. 결과를 정적 캐시에 보관.
+ *
+ * getpwuid_r(): thread-safe 버전. 내부 정적 버퍼를 쓰지 않는다.
+ * 반환된 포인터는 캐시 내 string 의 c_str() 이므로 다음 호출 전까지 유효.
+ */
+static const char *uid_name(uint32_t uid)
+{
+    static std::unordered_map<uint32_t, std::string> cache;
+    auto it = cache.find(uid);
+    if (it != cache.end()) return it->second.c_str();
+
+    char buf[256];
+    struct passwd pw, *result = nullptr;
+    if (getpwuid_r(uid, &pw, buf, sizeof(buf), &result) == 0 && result)
+        cache[uid] = result->pw_name;
+    else
+        cache[uid] = std::to_string(uid); /* 매핑 없으면 숫자 그대로 */
+    return cache[uid].c_str();
+}
+
+/* ── 세션 통계 ──────────────────────────────────────────────────────────── */
+
+static uint64_t g_n_proc = 0, g_n_file = 0, g_n_net = 0;
+static std::unordered_map<std::string, uint32_t> g_rule_counts;
 
 static std::vector<RuleMatch> dedup_alerts(std::vector<RuleMatch> hits,
                                             const char *comm, uint64_t ts_ns)
@@ -138,9 +169,11 @@ static int handle_proc_event(void *, void *data, size_t sz)
     auto hits = dedup_alerts(match_rules(e, par), e.comm, e.ts_ns);
     bool alert = !hits.empty();
     g_proc_tree.update(e.pid, e.ppid, e.comm);
+    g_n_proc++;
+    for (const auto &h : hits) g_rule_counts[h.id]++;
 
-    printf("[EXEC ] %9.3fs  PID=%-6u PPID=%-6u UID=%-5u  %-16s  %s\n",
-           (double)e.ts_ns / 1e9, e.pid, e.ppid, e.uid, e.comm, e.filename);
+    printf("[EXEC ] %9.3fs  PID=%-6u PPID=%-6u %-12s  %-16s  %s\n",
+           (double)e.ts_ns / 1e9, e.pid, e.ppid, uid_name(e.uid), e.comm, e.filename);
 
     /* 부모 comm 이 알려진 경우 표시 */
     if (par)
@@ -183,19 +216,21 @@ static int handle_file_event(void *, void *data, size_t sz)
     auto hits = dedup_alerts(match_rules(e), e.comm, e.ts_ns);
     bool alert = !hits.empty();
     double ts = (double)e.ts_ns / 1e9;
+    g_n_file++;
+    for (const auto &h : hits) g_rule_counts[h.id]++;
 
     switch (e.type) {
     case EVENT_FILE_WRITE:
-        printf("[WRITE] %9.3fs  PID=%-6u UID=%-5u  %-16s  [%s] %s\n",
-               ts, e.pid, e.uid, e.comm, decode_flags(e.flags).c_str(), e.path);
+        printf("[WRITE] %9.3fs  PID=%-6u %-12s  %-16s  [%s] %s\n",
+               ts, e.pid, uid_name(e.uid), e.comm, decode_flags(e.flags).c_str(), e.path);
         break;
     case EVENT_FILE_DELETE:
-        printf("[DELET] %9.3fs  PID=%-6u UID=%-5u  %-16s  %s\n",
-               ts, e.pid, e.uid, e.comm, e.path);
+        printf("[DELET] %9.3fs  PID=%-6u %-12s  %-16s  %s\n",
+               ts, e.pid, uid_name(e.uid), e.comm, e.path);
         break;
     case EVENT_FILE_RENAME:
-        printf("[RENAM] %9.3fs  PID=%-6u UID=%-5u  %-16s  %s  →  %s\n",
-               ts, e.pid, e.uid, e.comm, e.path, e.path2);
+        printf("[RENAM] %9.3fs  PID=%-6u %-12s  %-16s  %s  →  %s\n",
+               ts, e.pid, uid_name(e.uid), e.comm, e.path, e.path2);
         break;
     }
 
@@ -212,17 +247,19 @@ static int handle_net_event(void *, void *data, size_t sz)
     auto hits = dedup_alerts(match_rules(e), e.comm, e.ts_ns);
     bool alert = !hits.empty();
     double ts  = (double)e.ts_ns / 1e9;
+    g_n_net++;
+    for (const auto &h : hits) g_rule_counts[h.id]++;
 
     char ip[INET6_ADDRSTRLEN] = {};
     inet_ntop((e.family == 10) ? AF_INET6 : AF_INET, e.daddr, ip, sizeof(ip));
     uint16_t port = ntohs(e.dport);
 
     if (e.type == EVENT_NET_CONNECT)
-        printf("[CONN ] %9.3fs  PID=%-6u UID=%-5u  %-16s  → %s:%u\n",
-               ts, e.pid, e.uid, e.comm, ip, port);
+        printf("[CONN ] %9.3fs  PID=%-6u %-12s  %-16s  → %s:%u\n",
+               ts, e.pid, uid_name(e.uid), e.comm, ip, port);
     else
-        printf("[BIND ] %9.3fs  PID=%-6u UID=%-5u  %-16s  *:%u\n",
-               ts, e.pid, e.uid, e.comm, port);
+        printf("[BIND ] %9.3fs  PID=%-6u %-12s  %-16s  *:%u\n",
+               ts, e.pid, uid_name(e.uid), e.comm, port);
 
     print_alerts(hits);
     emit(to_json(e, hits), alert);
@@ -364,8 +401,8 @@ int main(int argc, char **argv)
         "|   Ctrl+C 로 종료                                                    |\n"
         "+----------------------------------------------------------------------+\n"
         RESET);
-    printf("%-8s %-10s %-8s %-6s  %-16s  %s\n",
-           "TYPE", "TIME(s)", "PID", "UID", "COMM", "PATH / DEST");
+    printf("%-8s %-10s %-8s %-12s  %-16s  %s\n",
+           "TYPE", "TIME(s)", "PID", "USER", "COMM", "PATH / DEST");
     printf("%s\n", std::string(72, '-').c_str());
 
     /* ── 이벤트 폴 루프 ───────────────────────────────────────────────── */
@@ -378,6 +415,25 @@ int main(int argc, char **argv)
     printf("\n[*] 종료 중...\n");
     ring_buffer__consume(rb);  /* 폴 루프 종료 후 남은 이벤트 드레인 */
     if (g_reporter) g_reporter->flush();
+
+    /* ── 세션 통계 출력 ────────────────────────────────────────────────── */
+    uint64_t total = g_n_proc + g_n_file + g_n_net;
+    printf("\n" BOLD "=== 세션 통계 ===\n" RESET);
+    printf("총 이벤트: %" PRIu64 "  (EXEC=%" PRIu64 "  FILE=%" PRIu64 "  NET=%" PRIu64 ")\n",
+           total, g_n_proc, g_n_file, g_n_net);
+
+    if (!g_rule_counts.empty()) {
+        printf("\n%-10s  %s\n", "룰", "발화 횟수");
+        printf("%s\n", std::string(28, '-').c_str());
+        std::vector<std::pair<std::string, uint32_t>> sorted(
+            g_rule_counts.begin(), g_rule_counts.end());
+        std::sort(sorted.begin(), sorted.end(),
+            [](const auto &a, const auto &b){ return a.second > b.second; });
+        for (const auto &kv : sorted)
+            printf("%-10s  %u 회\n", kv.first.c_str(), kv.second);
+    } else {
+        printf("알림 없음\n");
+    }
 
 cleanup:
     ring_buffer__free(rb);

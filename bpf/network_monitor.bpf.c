@@ -99,35 +99,43 @@ struct {
     __uint(max_entries, 1 << 20); /* 1 MiB */
 } rb SEC(".maps");
 
-/* ── 공통 헬퍼: sockaddr 파싱 + 이벤트 채우기 ──────────────────────────── */
+/*
+ * pending_connect: sys_enter_connect → sys_exit_connect 데이터 전달 채널.
+ *
+ * connect()의 sockaddr 는 sys_enter 시점에만 유효하다.
+ * sys_exit 에서 성공 여부를 확인한 뒤 링버퍼에 제출하기 위해
+ * TID 를 키로 net_event 를 임시 보관한다.
+ *
+ * TID(스레드 ID)로 키잉하는 이유:
+ *   멀티스레드 프로세스에서 두 스레드가 동시에 connect() 하는 경우
+ *   PID(TGID)로 키잉하면 덮어쓰기가 발생한다.
+ *   TID = bpf_get_current_pid_tgid() 하위 32비트.
+ */
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 4096);
+    __type(key,   __u32);           /* TID */
+    __type(value, struct net_event);
+} pending_connect SEC(".maps");
+
+/* ── 공통 헬퍼: sockaddr 파싱 ───────────────────────────────────────────── */
 
 /*
- * parse_and_submit():
- *   유저스페이스의 struct sockaddr * 를 읽어 net_event 를 링버퍼에 제출.
+ * fill_net_event(): sockaddr 유저 포인터를 읽어 net_event 를 채운다.
+ * 반환값: 0 = 성공, -1 = 실패(비IP 소켓 또는 읽기 오류).
  *
- *   1단계: sa_family(2 bytes) 만 먼저 읽어 AF_INET / AF_INET6 판별.
- *   2단계: 확인된 family 에 맞는 크기의 구조체를 한 번에 읽음.
- *
- *   bpf_probe_read_user():
- *     첫 번째 인자: 목적지 (BPF 스택 또는 맵 슬롯)
- *     세 번째 인자: 유저 VA 포인터
- *     SMAP(Supervisor Mode Access Prevention) 우회를 BPF 런타임이 처리.
+ * bpf_probe_read_user():
+ *   SMAP(Supervisor Mode Access Prevention) 우회를 BPF 런타임이 처리.
  */
-static __always_inline int parse_and_submit(__u32 type,
-                                             const void *uaddr)
+static __always_inline int fill_net_event(struct net_event *e,
+                                           __u32 type,
+                                           const void *uaddr)
 {
     __u16 family;
-
-    /* Step 1: family 필드만 먼저 읽기 (2 bytes) */
     if (bpf_probe_read_user(&family, sizeof(family), uaddr) < 0)
-        return 0;
-
+        return -1;
     if (family != AF_INET && family != AF_INET6)
-        return 0; /* AF_UNIX, AF_NETLINK 등 비IP 소켓 제외 */
-
-    struct net_event *e = bpf_ringbuf_reserve(&rb, sizeof(*e), 0);
-    if (!e)
-        return 0;
+        return -1; /* AF_UNIX, AF_NETLINK 등 비IP 소켓 제외 */
 
     __u64 pid_tgid = bpf_get_current_pid_tgid();
     e->type   = type;
@@ -137,50 +145,91 @@ static __always_inline int parse_and_submit(__u32 type,
     e->ts_ns  = bpf_ktime_get_ns();
     bpf_get_current_comm(&e->comm, sizeof(e->comm));
 
-    /* Step 2: family 별로 전체 sockaddr 읽기 */
     if (family == AF_INET) {
         struct edr_sockaddr_in sa4;
-        if (bpf_probe_read_user(&sa4, sizeof(sa4), uaddr) < 0) {
-            bpf_ringbuf_discard(e, 0);
-            return 0;
-        }
-        e->dport = sa4.port;                     /* 이미 big-endian */
+        if (bpf_probe_read_user(&sa4, sizeof(sa4), uaddr) < 0) return -1;
+        e->dport = sa4.port;
         __builtin_memcpy(e->daddr, sa4.addr, 4);
-        __builtin_memset(e->daddr + 4, 0, 12);  /* 나머지 12바이트 0으로 */
+        __builtin_memset(e->daddr + 4, 0, 12);
     } else {
         struct edr_sockaddr_in6 sa6;
-        if (bpf_probe_read_user(&sa6, sizeof(sa6), uaddr) < 0) {
-            bpf_ringbuf_discard(e, 0);
-            return 0;
-        }
+        if (bpf_probe_read_user(&sa6, sizeof(sa6), uaddr) < 0) return -1;
         e->dport = sa6.port;
         __builtin_memcpy(e->daddr, sa6.addr, 16);
     }
-
-    bpf_ringbuf_submit(e, 0);
     return 0;
 }
 
-/* ── [1] connect(): 아웃바운드 연결 시도 ────────────────────────────────────
+/* bind 은 성공 여부 확인 없이 바로 제출 (기존 동작 유지) */
+static __always_inline int parse_and_submit(__u32 type, const void *uaddr)
+{
+    struct net_event *slot = bpf_ringbuf_reserve(&rb, sizeof(*slot), 0);
+    if (!slot) return 0;
+    if (fill_net_event(slot, type, uaddr) < 0) {
+        bpf_ringbuf_discard(slot, 0);
+        return 0;
+    }
+    bpf_ringbuf_submit(slot, 0);
+    return 0;
+}
+
+/* ── [1] connect(): 아웃바운드 연결 ─────────────────────────────────────────
  *
- * sys_enter_connect 인자:
- *   args[0] = sockfd    : 소켓 파일 디스크립터
- *   args[1] = uservaddr : struct sockaddr __user * (유저스페이스 포인터)
- *   args[2] = addrlen   : sizeof(sockaddr_in) 또는 sizeof(sockaddr_in6)
+ * 두 훅 패턴으로 "성공한 연결"만 캡처한다.
  *
- * 주의: 이 훅은 연결 "시도" 시점에 발화한다.
- *   - ECONNREFUSED: 상대방 포트 닫힘
- *   - ETIMEDOUT: 방화벽 드롭 등
- *   → 실패 케이스도 포착되므로 EDR 에서는 오히려 더 가치 있다.
+ *   sys_enter_connect: sockaddr 정보가 유효한 시점. pending_connect 에 보관.
+ *   sys_exit_connect:  반환값 확인.
+ *     ret == 0           : 즉시 성공 (UDP, 로컬 소켓)
+ *     ret == -EINPROGRESS: 논블로킹 TCP (SYN 전송됨, 연결 진행 중)
+ *     그 외              : 실패 (ECONNREFUSED, ETIMEDOUT 등) → 드롭
  *
- * TCP connect는 tcp_v4_connect()에서 SYN을 보내고 블록하지만,
- * 논블로킹(O_NONBLOCK) 소켓은 EINPROGRESS를 즉시 반환한다.
- * 두 경우 모두 sys_enter_connect 는 한 번 발화한다.
+ * EINPROGRESS(-115) 를 "성공"으로 취급하는 이유:
+ *   논블로킹 소켓은 connect() 가 즉시 -EINPROGRESS 를 반환하고
+ *   이후 poll/epoll 로 완료를 기다린다. 공격자가 사용하는 역방향 셸,
+ *   포트 스캐너 등은 대부분 논블로킹 소켓을 사용하므로 이를 포함해야 한다.
  */
+#define EINPROGRESS 115
+
 SEC("tp/syscalls/sys_enter_connect")
 int handle_connect(struct trace_event_raw_sys_enter *ctx)
 {
-    return parse_and_submit(EVENT_NET_CONNECT, (const void *)ctx->args[1]);
+    struct net_event e = {};
+    if (fill_net_event(&e, EVENT_NET_CONNECT, (const void *)ctx->args[1]) < 0)
+        return 0;
+    __u32 tid = (__u32)bpf_get_current_pid_tgid();
+    bpf_map_update_elem(&pending_connect, &tid, &e, BPF_ANY);
+    return 0;
+}
+
+/*
+ * sys_exit_connect: connect() 반환 시점에 성공 여부 확인 후 링버퍼 제출.
+ *
+ * ctx->ret: 커널이 sys_connect() 에서 반환하는 값 (long).
+ *   유저스페이스에는 음수 errno 로 변환되지만 BPF 에서는 음수 값 그대로.
+ *
+ * ts_ns 갱신: 연결 완료(또는 SYN 전송) 시각이 더 정확하므로 덮어쓴다.
+ */
+SEC("tp/syscalls/sys_exit_connect")
+int handle_connect_exit(struct trace_event_raw_sys_exit *ctx)
+{
+    __u32 tid = (__u32)bpf_get_current_pid_tgid();
+    struct net_event *pending = bpf_map_lookup_elem(&pending_connect, &tid);
+    if (!pending) return 0;
+
+    long ret = ctx->ret;
+    if (ret != 0 && ret != -(long)EINPROGRESS) {
+        bpf_map_delete_elem(&pending_connect, &tid);
+        return 0;
+    }
+
+    struct net_event *slot = bpf_ringbuf_reserve(&rb, sizeof(*slot), 0);
+    if (slot) {
+        __builtin_memcpy(slot, pending, sizeof(*slot));
+        slot->ts_ns = bpf_ktime_get_ns(); /* 연결 완료 시각으로 갱신 */
+        bpf_ringbuf_submit(slot, 0);
+    }
+    bpf_map_delete_elem(&pending_connect, &tid);
+    return 0;
 }
 
 /* ── [2] bind(): 서버 소켓 오픈 감지 ────────────────────────────────────────
