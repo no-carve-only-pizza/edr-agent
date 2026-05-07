@@ -28,12 +28,14 @@
  *                    [--log FILE] [--alerts-only]
  */
 
+#include <algorithm>
 #include <arpa/inet.h>
 #include <cerrno>
 #include <csignal>
 #include <cstdio>
 #include <cstring>
 #include <string>
+#include <unordered_map>
 #include <vector>
 #include <getopt.h>
 
@@ -54,6 +56,36 @@ static volatile bool g_running = true;
 static FILE         *g_logfile  = nullptr;
 static HttpReporter *g_reporter = nullptr;
 static ProcTree      g_proc_tree;
+
+/*
+ * 알림 중복 억제 (dedup):
+ *
+ * 동일 룰이 단시간에 대량 발화하는 패턴(R-007 서버 바인드 연속, pip install 중
+ * R-005 반복 등)을 억제하기 위해 (rule_id, comm) 쌍을 키로 마지막 발화
+ * 타임스탬프를 기록한다. DEDUP_NS 이내에 같은 키가 재발화하면 출력을 건너뛴다.
+ *
+ * PID가 아닌 comm 으로 키잉하는 이유:
+ *   PID 는 재사용될 수 있고, 같은 종류의 프로세스 인스턴스 N개가 동시에
+ *   같은 룰을 트리거할 때 전부 억제하는 것이 의도된 동작이다.
+ */
+static std::unordered_map<std::string, uint64_t> g_dedup; /* key → last ts_ns */
+static constexpr uint64_t DEDUP_NS = 3ULL * 1'000'000'000ULL; /* 3초 */
+
+static std::vector<RuleMatch> dedup_alerts(std::vector<RuleMatch> hits,
+                                            const char *comm, uint64_t ts_ns)
+{
+    auto end = std::remove_if(hits.begin(), hits.end(),
+        [&](const RuleMatch &h) {
+            std::string key = std::string(h.id) + ":" + comm;
+            auto it = g_dedup.find(key);
+            if (it != g_dedup.end() && ts_ns - it->second < DEDUP_NS)
+                return true;
+            g_dedup[key] = ts_ns;
+            return false;
+        });
+    hits.erase(end, hits.end());
+    return hits;
+}
 
 static void sig_handler(int) { g_running = false; }
 
@@ -103,7 +135,7 @@ static int handle_proc_event(void *, void *data, size_t sz)
      * update() 이후에는 e.pid 가 덮여쓰일 수 있다 (PID 재사용).
      */
     const char *par = g_proc_tree.comm_of(e.ppid);
-    auto hits = match_rules(e, par);
+    auto hits = dedup_alerts(match_rules(e, par), e.comm, e.ts_ns);
     bool alert = !hits.empty();
     g_proc_tree.update(e.pid, e.ppid, e.comm);
 
@@ -148,7 +180,7 @@ static int handle_file_event(void *, void *data, size_t sz)
     if (sz < sizeof(file_event)) return 0;
     const auto &e = *static_cast<const file_event *>(data);
 
-    auto hits = match_rules(e);
+    auto hits = dedup_alerts(match_rules(e), e.comm, e.ts_ns);
     bool alert = !hits.empty();
     double ts = (double)e.ts_ns / 1e9;
 
@@ -177,7 +209,7 @@ static int handle_net_event(void *, void *data, size_t sz)
     if (sz < sizeof(net_event)) return 0;
     const auto &e = *static_cast<const net_event *>(data);
 
-    auto hits = match_rules(e);
+    auto hits = dedup_alerts(match_rules(e), e.comm, e.ts_ns);
     bool alert = !hits.empty();
     double ts  = (double)e.ts_ns / 1e9;
 
@@ -194,6 +226,14 @@ static int handle_net_event(void *, void *data, size_t sz)
 
     print_alerts(hits);
     emit(to_json(e, hits), alert);
+    return 0;
+}
+
+static int handle_exit_event(void *, void *data, size_t sz)
+{
+    if (sz < sizeof(exit_event)) return 0;
+    const auto &e = *static_cast<const exit_event *>(data);
+    g_proc_tree.remove(e.pid);
     return 0;
 }
 
@@ -302,9 +342,11 @@ int main(int argc, char **argv)
     if (!rb) { err = -1; goto cleanup; }
 
     if ((err = ring_buffer__add(rb, bpf_map__fd(file_skel->maps.rb),
-                                handle_file_event, nullptr)) < 0) goto cleanup;
+                                handle_file_event,  nullptr)) < 0) goto cleanup;
     if ((err = ring_buffer__add(rb, bpf_map__fd(net_skel->maps.rb),
-                                handle_net_event,  nullptr)) < 0) goto cleanup;
+                                handle_net_event,   nullptr)) < 0) goto cleanup;
+    if ((err = ring_buffer__add(rb, bpf_map__fd(proc_skel->maps.rb_exit),
+                                handle_exit_event,  nullptr)) < 0) goto cleanup;
 
     /* ── 프로세스 트리 초기화 ────────────────────────────────────────────
      *
@@ -334,6 +376,7 @@ int main(int argc, char **argv)
     }
 
     printf("\n[*] 종료 중...\n");
+    ring_buffer__consume(rb);  /* 폴 루프 종료 후 남은 이벤트 드레인 */
     if (g_reporter) g_reporter->flush();
 
 cleanup:

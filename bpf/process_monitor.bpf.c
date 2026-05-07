@@ -55,6 +55,12 @@ struct {
     __uint(max_entries, 1 << 20); /* 1 MiB */
 } rb SEC(".maps");
 
+/* 프로세스 종료 이벤트 전용 링버퍼. exit_event 크기가 작으므로 256 KiB 충분. */
+struct {
+    __uint(type, BPF_MAP_TYPE_RINGBUF);
+    __uint(max_entries, 1 << 18); /* 256 KiB */
+} rb_exit SEC(".maps");
+
 /*
  * argv_store: sys_enter_execve → sched_process_exec 데이터 전달 채널.
  *
@@ -324,4 +330,45 @@ int handle_sys_execve(struct trace_event_raw_sys_enter *ctx)
  * bpf_probe_read_kernel() 등 "GPL only" helper를 사용할 수 있다.
  * 커널이 bpf(BPF_PROG_LOAD) 시 이 필드를 검사한다.
  */
+/*
+ * sched_process_exit: 프로세스 종료 시 ProcTree 정리를 위한 훅.
+ *
+ * 유저스페이스의 g_proc_tree 는 exec 이벤트로만 채워지므로,
+ * 종료된 PID 를 명시적으로 알려주지 않으면 메모리가 계속 증가한다.
+ *
+ * 스레드 필터링:
+ *   스레드 종료 시에도 이 훅이 발화하므로, TID != TGID 인 경우를 걸러낸다.
+ *   커널 내부: task_struct.pid (TID) vs task_struct.tgid (TGID/PID)
+ *   bpf_get_current_pid_tgid(): [63:32]=TGID, [31:0]=TID
+ *
+ * exit_code: task_struct.exit_code
+ *   정상 종료: (exit_code >> 8) & 0xFF = 종료 코드
+ *   시그널:    exit_code & 0x7F = 시그널 번호
+ */
+SEC("tp/sched/sched_process_exit")
+int handle_exit(void *ctx)
+{
+    __u64 pid_tgid = bpf_get_current_pid_tgid();
+    __u32 tgid     = (__u32)(pid_tgid >> 32);
+    __u32 tid      = (__u32)pid_tgid;
+
+    /* 스레드 종료는 무시 - 프로세스 리더(메인 스레드)만 처리 */
+    if (tgid != tid)
+        return 0;
+
+    struct exit_event *e = bpf_ringbuf_reserve(&rb_exit, sizeof(*e), 0);
+    if (!e)
+        return 0;
+
+    e->pid       = tgid;
+    e->ts_ns     = bpf_ktime_get_ns();
+    bpf_get_current_comm(&e->comm, sizeof(e->comm));
+
+    struct task_struct *task = (struct task_struct *)bpf_get_current_task();
+    e->exit_code = BPF_CORE_READ(task, exit_code);
+
+    bpf_ringbuf_submit(e, 0);
+    return 0;
+}
+
 char LICENSE[] SEC("license") = "GPL";
