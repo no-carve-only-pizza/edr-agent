@@ -516,6 +516,22 @@ std::vector<RuleMatch> match_rules(const ptrace_event &e)
     return hits;
 }
 
+std::vector<RuleMatch> match_rules(const memory_event &e)
+{
+    std::vector<RuleMatch> hits;
+
+    /*
+     * R-016: RWX 메모리 할당 감지.
+     * PROT_EXEC(4) 와 PROT_WRITE(2) 가 동시에 설정된 메모리는
+     * 쉘코드 삽입(JIT 스프레이 등)에 주로 사용된다.
+     */
+    if ((e.prot & 6) == 6) { // PROT_WRITE | PROT_EXEC
+        hits.push_back({"R-016", "RWX 메모리 할당 (JIT/쉘코드 의심)", "high"});
+    }
+
+    return hits;
+}
+
 /* ── 유틸리티 ───────────────────────────────────────────────────────────── */
 
 const char *severity_color(const char *severity)

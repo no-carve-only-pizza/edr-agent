@@ -232,6 +232,17 @@ int handle_connect_exit(struct trace_event_raw_sys_exit *ctx)
     return 0;
 }
 
+/*
+ * sched_process_exit: 스레드 종료 시 pending_connect 맵 찌꺼기 클린업
+ */
+SEC("tp/sched/sched_process_exit")
+int handle_net_exit(void *ctx)
+{
+    __u32 tid = (__u32)bpf_get_current_pid_tgid();
+    bpf_map_delete_elem(&pending_connect, &tid);
+    return 0;
+}
+
 /* ── [2] bind(): 서버 소켓 오픈 감지 ────────────────────────────────────────
  *
  * sys_enter_bind 인자:
