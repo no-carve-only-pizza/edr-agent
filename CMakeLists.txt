@@ -101,14 +101,26 @@ set(BPF_CFLAGS
     -I${LIBBPF_INCLUDE_DIRS}
 )
 
-# ── Step A: vmlinux.h 생성 ────────────────────────────────────────────────
-add_custom_command(
-    OUTPUT  ${VMLINUX_H}
-    COMMAND ${BPFTOOL} btf dump file /sys/kernel/btf/vmlinux format c
-            > ${VMLINUX_H}
-    COMMENT "vmlinux.h 생성: BTF → C 타입 덤프"
-    VERBATIM
-)
+# ── Step A: vmlinux.h 준비 ────────────────────────────────────────────────
+# include/vmlinux.h 가 레포에 포함되어 있으면 복사해서 사용한다.
+# 없으면 bpftool로 현재 커널에서 생성한다.
+if(EXISTS ${CMAKE_SOURCE_DIR}/include/vmlinux.h)
+    add_custom_command(
+        OUTPUT  ${VMLINUX_H}
+        COMMAND ${CMAKE_COMMAND} -E copy
+                ${CMAKE_SOURCE_DIR}/include/vmlinux.h ${VMLINUX_H}
+        COMMENT "vmlinux.h 복사 (pre-generated)"
+        VERBATIM
+    )
+else()
+    add_custom_command(
+        OUTPUT  ${VMLINUX_H}
+        COMMAND ${BPFTOOL} btf dump file /sys/kernel/btf/vmlinux format c
+                > ${VMLINUX_H}
+        COMMENT "vmlinux.h 생성: BTF → C 타입 덤프"
+        VERBATIM
+    )
+endif()
 
 # BPF 컴파일 + DWARF 제거 + 스켈레톤 생성 매크로
 # clang -g 로 컴파일 후 llvm-strip --strip-debug 로 .debug_* 섹션만 제거.
