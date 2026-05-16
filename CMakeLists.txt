@@ -16,9 +16,12 @@ find_package(PkgConfig REQUIRED)
 pkg_check_modules(LIBBPF REQUIRED libbpf)
 
 # clang: BPF 프로그램을 BPF ISA로 크로스 컴파일
-find_program(CLANG clang REQUIRED
+# Ubuntu에서 버전 접미사(clang-14 등)로 설치될 수 있으므로 순서대로 탐색한다.
+find_program(CLANG
+    NAMES clang clang-18 clang-17 clang-16 clang-15 clang-14 clang-13
     HINTS /usr/bin /usr/local/bin
-    DOC "Clang compiler for BPF programs")
+    DOC "Clang compiler for BPF programs"
+    REQUIRED)
 
 # bpftool: vmlinux.h 생성 + 스켈레톤 헤더 생성
 # Ubuntu: sudo apt install linux-tools-$(uname -r) linux-tools-common
