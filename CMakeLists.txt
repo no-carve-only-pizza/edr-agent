@@ -23,16 +23,30 @@ find_program(CLANG clang REQUIRED
 # bpftool: vmlinux.h 생성 + 스켈레톤 헤더 생성
 # Ubuntu: sudo apt install linux-tools-$(uname -r) linux-tools-common
 #
-# 커널 버전 전용 bpftool을 우선 탐색한다.
-# /usr/sbin/bpftool 은 linux-tools-common 패키지가 제공하는 shim 스크립트로,
-# 실제 버전이 실행 중인 커널과 다를 수 있어 BPF ELF 릴로케이션 파싱 실패의
-# 원인이 된다 ("Relocations in generic ELF (EM: 247)").
+# cmake find_program 탐색 순서: HINTS → 시스템 경로 → PATHS
+# 커널 버전 전용 경로를 HINTS에 넣어야 /usr/sbin/bpftool(shim)보다 먼저 선택된다.
 execute_process(COMMAND uname -r OUTPUT_VARIABLE KVER OUTPUT_STRIP_TRAILING_WHITESPACE)
 find_program(BPFTOOL bpftool
-    PATHS /usr/lib/linux-tools/${KVER}
-    HINTS /usr/sbin /usr/local/sbin /usr/lib/linux-tools
+    HINTS /usr/lib/linux-tools/${KVER}
+    PATHS /usr/sbin /usr/local/sbin /usr/lib/linux-tools
     DOC "bpftool for BPF skeleton generation"
     REQUIRED)
+
+# llvm-strip: BPF 오브젝트에서 DWARF 섹션 제거용
+# clang -g 는 BTF(.BTF/.BTF.ext)와 DWARF(.debug_*) 를 모두 생성한다.
+# bpftool(libbpf v1.4 이하)은 .debug_* 릴로케이션을 처리하지 못해
+# "Relocations in generic ELF (EM: 247)" 에러를 낸다.
+# llvm-strip --strip-debug 로 DWARF만 제거하면 BTF는 그대로 유지된다.
+find_program(LLVM_STRIP
+    NAMES llvm-strip llvm-strip-18 llvm-strip-17 llvm-strip-16
+          llvm-strip-15 llvm-strip-14 llvm-strip-13
+    HINTS /usr/bin /usr/local/bin
+    DOC "llvm-strip for stripping DWARF from BPF objects")
+if(NOT LLVM_STRIP)
+    message(WARNING "llvm-strip 을 찾지 못했습니다. BPF DWARF 제거 단계를 건너뜁니다.\n"
+                    "  Ubuntu: sudo apt install llvm")
+endif()
+message(STATUS "llvm-strip: ${LLVM_STRIP}")
 
 message(STATUS "clang:   ${CLANG}")
 message(STATUS "bpftool: ${BPFTOOL}")
@@ -93,101 +107,35 @@ add_custom_command(
     VERBATIM
 )
 
-# ── Step B-1: process_monitor 컴파일 & 스켈레톤 생성 ─────────────────────
-add_custom_command(
-    OUTPUT  ${PROC_BPF_OBJ}
-    COMMAND ${CLANG} ${BPF_CFLAGS} -c ${PROC_BPF_SRC} -o ${PROC_BPF_OBJ}
-    DEPENDS ${PROC_BPF_SRC} ${VMLINUX_H}
-    COMMENT "BPF 컴파일: process_monitor.bpf.c"
-    VERBATIM
-)
-add_custom_command(
-    OUTPUT  ${PROC_BPF_SKEL}
-    COMMAND ${BPFTOOL} gen skeleton ${PROC_BPF_OBJ} > ${PROC_BPF_SKEL}
-    DEPENDS ${PROC_BPF_OBJ}
-    COMMENT "스켈레톤 생성: process_monitor.skel.h"
-    VERBATIM
-)
+# BPF 컴파일 + DWARF 제거 + 스켈레톤 생성 매크로
+# clang -g 로 컴파일 후 llvm-strip --strip-debug 로 .debug_* 섹션만 제거.
+# .BTF / .BTF.ext 는 SHT_PROGBITS 이름 기반이라 --strip-debug 영향 없음.
+macro(bpf_target NAME SRC OBJ SKEL)
+    add_custom_command(
+        OUTPUT  ${OBJ}
+        COMMAND ${CLANG} ${BPF_CFLAGS} -c ${SRC} -o ${OBJ}
+        COMMAND $<IF:$<BOOL:${LLVM_STRIP}>,${LLVM_STRIP},true>
+                --strip-debug ${OBJ}
+        DEPENDS ${SRC} ${VMLINUX_H}
+        COMMENT "BPF 컴파일 + DWARF 제거: ${NAME}"
+        VERBATIM
+    )
+    add_custom_command(
+        OUTPUT  ${SKEL}
+        COMMAND ${BPFTOOL} gen skeleton ${OBJ} > ${SKEL}
+        DEPENDS ${OBJ}
+        COMMENT "스켈레톤 생성: ${NAME}.skel.h"
+        VERBATIM
+    )
+endmacro()
 
-# ── Step B-2: file_monitor 컴파일 & 스켈레톤 생성 ────────────────────────
-add_custom_command(
-    OUTPUT  ${FILE_BPF_OBJ}
-    COMMAND ${CLANG} ${BPF_CFLAGS} -c ${FILE_BPF_SRC} -o ${FILE_BPF_OBJ}
-    DEPENDS ${FILE_BPF_SRC} ${VMLINUX_H}
-    COMMENT "BPF 컴파일: file_monitor.bpf.c"
-    VERBATIM
-)
-add_custom_command(
-    OUTPUT  ${FILE_BPF_SKEL}
-    COMMAND ${BPFTOOL} gen skeleton ${FILE_BPF_OBJ} > ${FILE_BPF_SKEL}
-    DEPENDS ${FILE_BPF_OBJ}
-    COMMENT "스켈레톤 생성: file_monitor.skel.h"
-    VERBATIM
-)
-
-# ── Step B-3: network_monitor 컴파일 & 스켈레톤 생성 ─────────────────────
-add_custom_command(
-    OUTPUT  ${NET_BPF_OBJ}
-    COMMAND ${CLANG} ${BPF_CFLAGS} -c ${NET_BPF_SRC} -o ${NET_BPF_OBJ}
-    DEPENDS ${NET_BPF_SRC} ${VMLINUX_H}
-    COMMENT "BPF 컴파일: network_monitor.bpf.c"
-    VERBATIM
-)
-add_custom_command(
-    OUTPUT  ${NET_BPF_SKEL}
-    COMMAND ${BPFTOOL} gen skeleton ${NET_BPF_OBJ} > ${NET_BPF_SKEL}
-    DEPENDS ${NET_BPF_OBJ}
-    COMMENT "스켈레톤 생성: network_monitor.skel.h"
-    VERBATIM
-)
-
-# ── Step B-4: memory_monitor 컴파일 & 스켈레톤 생성 ─────────────────────
-add_custom_command(
-    OUTPUT  ${MEM_BPF_OBJ}
-    COMMAND ${CLANG} ${BPF_CFLAGS} -c ${MEM_BPF_SRC} -o ${MEM_BPF_OBJ}
-    DEPENDS ${MEM_BPF_SRC} ${VMLINUX_H}
-    COMMENT "BPF 컴파일: memory_monitor.bpf.c"
-    VERBATIM
-)
-add_custom_command(
-    OUTPUT  ${MEM_BPF_SKEL}
-    COMMAND ${BPFTOOL} gen skeleton ${MEM_BPF_OBJ} > ${MEM_BPF_SKEL}
-    DEPENDS ${MEM_BPF_OBJ}
-    COMMENT "스켈레톤 생성: memory_monitor.skel.h"
-    VERBATIM
-)
-
-# ── Step B-5: dns_monitor 컴파일 & 스켈레톤 생성 ─────────────────────────
-add_custom_command(
-    OUTPUT  ${DNS_BPF_OBJ}
-    COMMAND ${CLANG} ${BPF_CFLAGS} -c ${DNS_BPF_SRC} -o ${DNS_BPF_OBJ}
-    DEPENDS ${DNS_BPF_SRC} ${VMLINUX_H}
-    COMMENT "BPF 컴파일: dns_monitor.bpf.c"
-    VERBATIM
-)
-add_custom_command(
-    OUTPUT  ${DNS_BPF_SKEL}
-    COMMAND ${BPFTOOL} gen skeleton ${DNS_BPF_OBJ} > ${DNS_BPF_SKEL}
-    DEPENDS ${DNS_BPF_OBJ}
-    COMMENT "스켈레톤 생성: dns_monitor.skel.h"
-    VERBATIM
-)
-
-# ── Step B-6: ns_monitor 컴파일 & 스켈레톤 생성 ──────────────────────────
-add_custom_command(
-    OUTPUT  ${NS_BPF_OBJ}
-    COMMAND ${CLANG} ${BPF_CFLAGS} -c ${NS_BPF_SRC} -o ${NS_BPF_OBJ}
-    DEPENDS ${NS_BPF_SRC} ${VMLINUX_H}
-    COMMENT "BPF 컴파일: ns_monitor.bpf.c"
-    VERBATIM
-)
-add_custom_command(
-    OUTPUT  ${NS_BPF_SKEL}
-    COMMAND ${BPFTOOL} gen skeleton ${NS_BPF_OBJ} > ${NS_BPF_SKEL}
-    DEPENDS ${NS_BPF_OBJ}
-    COMMENT "스켈레톤 생성: ns_monitor.skel.h"
-    VERBATIM
-)
+# ── Step B-1 ~ B-6: 각 BPF 프로그램 빌드 ────────────────────────────────
+bpf_target(process_monitor ${PROC_BPF_SRC} ${PROC_BPF_OBJ} ${PROC_BPF_SKEL})
+bpf_target(file_monitor    ${FILE_BPF_SRC} ${FILE_BPF_OBJ} ${FILE_BPF_SKEL})
+bpf_target(network_monitor ${NET_BPF_SRC}  ${NET_BPF_OBJ}  ${NET_BPF_SKEL})
+bpf_target(memory_monitor  ${MEM_BPF_SRC}  ${MEM_BPF_OBJ}  ${MEM_BPF_SKEL})
+bpf_target(dns_monitor     ${DNS_BPF_SRC}  ${DNS_BPF_OBJ}  ${DNS_BPF_SKEL})
+bpf_target(ns_monitor      ${NS_BPF_SRC}   ${NS_BPF_OBJ}   ${NS_BPF_SKEL})
 
 add_custom_target(bpf_build DEPENDS
     ${PROC_BPF_SKEL} ${FILE_BPF_SKEL} ${NET_BPF_SKEL}
