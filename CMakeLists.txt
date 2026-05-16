@@ -22,17 +22,17 @@ find_program(CLANG clang REQUIRED
 
 # bpftool: vmlinux.h 생성 + 스켈레톤 헤더 생성
 # Ubuntu: sudo apt install linux-tools-$(uname -r) linux-tools-common
+#
+# 커널 버전 전용 bpftool을 우선 탐색한다.
+# /usr/sbin/bpftool 은 linux-tools-common 패키지가 제공하는 shim 스크립트로,
+# 실제 버전이 실행 중인 커널과 다를 수 있어 BPF ELF 릴로케이션 파싱 실패의
+# 원인이 된다 ("Relocations in generic ELF (EM: 247)").
+execute_process(COMMAND uname -r OUTPUT_VARIABLE KVER OUTPUT_STRIP_TRAILING_WHITESPACE)
 find_program(BPFTOOL bpftool
-    HINTS /usr/sbin /usr/lib/linux-tools
-          # uname -r 기반 경로를 fallback으로 탐색
-    DOC "bpftool for BPF skeleton generation")
-if(NOT BPFTOOL)
-    # linux-tools-$(uname -r) 경로 직접 탐색
-    execute_process(COMMAND uname -r OUTPUT_VARIABLE KVER OUTPUT_STRIP_TRAILING_WHITESPACE)
-    find_program(BPFTOOL bpftool
-        PATHS /usr/lib/linux-tools/${KVER}
-        REQUIRED)
-endif()
+    PATHS /usr/lib/linux-tools/${KVER}
+    HINTS /usr/sbin /usr/local/sbin /usr/lib/linux-tools
+    DOC "bpftool for BPF skeleton generation"
+    REQUIRED)
 
 message(STATUS "clang:   ${CLANG}")
 message(STATUS "bpftool: ${BPFTOOL}")
@@ -71,8 +71,14 @@ set(NS_BPF_OBJ  ${CMAKE_BINARY_DIR}/ns_monitor.bpf.o)
 set(NS_BPF_SKEL ${CMAKE_BINARY_DIR}/ns_monitor.skel.h)
 
 # 공통 clang 플래그 (BPF 크로스 컴파일)
+#
+# -mcpu=v2: BPF ISA v2로 고정.
+#   clang-14 + Ubuntu 22.04 환경에서 -mcpu 미지정 시 bpftool이 처리하지 못하는
+#   릴로케이션 타입을 생성할 수 있다. v2는 커널 4.14+ 에서 지원하며
+#   현재 지원 최소 커널(5.3)을 충족한다.
+#   더 높은 커널/clang 버전에서는 -mcpu=v3 또는 -mcpu=probe 사용 가능.
 set(BPF_CFLAGS
-    -g -O2 -target bpf -D__TARGET_ARCH_x86
+    -g -O2 -target bpf -mcpu=v2 -D__TARGET_ARCH_x86
     -I${CMAKE_BINARY_DIR}
     -I${CMAKE_SOURCE_DIR}/include
     -I${LIBBPF_INCLUDE_DIRS}
